@@ -513,3 +513,54 @@ async def test_private_formation_control_moves_saved_teams_with_partial_failures
     assert "3 moved" in reply
     assert "<@4>" in reply
     assert "not connected" in reply
+
+
+async def test_private_room_close_cancels_lobby_and_refreshes_public_status(
+    party_repos, monkeypatch
+):
+    party, *_ = party_repos
+    lobby = party.create(
+        guild_id=1, organizer_id=1, capacity=2, operation_id="create"
+    )
+    for user_id in (1, 2):
+        lobby = party.save_participant(
+            1, lobby.lobby_id, Participant(user_id), operation_id=f"join-{user_id}"
+        )
+    for state, operation in (
+        (LobbyState.FULL, "full"),
+        (LobbyState.READY_CHECK, "ready"),
+        (LobbyState.FORMING, "forming"),
+    ):
+        lobby = party.transition(1, lobby.lobby_id, state, operation_id=operation)
+    lobby = party.set_delivery(
+        1,
+        lobby.lobby_id,
+        DiscordDelivery(panel_channel_id=600, panel_message_id=601),
+        operation_id="delivery",
+    )
+    room_service = MagicMock()
+    room_service.close = AsyncMock()
+    monkeypatch.setattr(
+        bot._party_lobby_deps, "match_room_service_for_guild", lambda guild: room_service
+    )
+    public_message = MagicMock()
+    public_message.edit = AsyncMock()
+    public_channel = MagicMock()
+    public_channel.fetch_message = AsyncMock(return_value=public_message)
+    guild = _guild(1)
+    guild.get_channel = lambda channel_id: public_channel if channel_id == 600 else None
+    interaction = _interaction(
+        user_id=1, guild=guild, message=_lobby_footer_message(lobby.lobby_id)
+    )
+
+    await bot._handle_lobby_card_action(interaction, "room_close")
+
+    room_service.close.assert_awaited_once_with(
+        lobby.lobby_id,
+        actor_id=1,
+        reason="organizer closed rooms",
+        outcome="cancelled",
+    )
+    assert party.get(1, lobby.lobby_id).state is LobbyState.CANCELLED
+    public_message.edit.assert_awaited_once()
+    assert public_message.edit.await_args.kwargs["view"] is None

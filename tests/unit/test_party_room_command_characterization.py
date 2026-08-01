@@ -7,6 +7,7 @@ adapter's orchestration is tested independently of MatchRoomService's own
 (already covered) internals.
 """
 
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -24,6 +25,7 @@ def room_service(monkeypatch):
     service.move_players = AsyncMock(return_value={})
     service.close = AsyncMock()
     service.get = AsyncMock()
+    service.get_report = AsyncMock()
     for method in (
         service.lock, service.unlock, service.remove_player,
         service.transfer_transactionally, service.close, service.get,
@@ -105,7 +107,10 @@ async def test_close_routes_to_service(room_service):
     interaction = _interaction()
     await bot.party_room.callback(interaction, lobby_id="lobby-1", action="close")
     room_service.close.assert_awaited_once_with(
-        "lobby-1", actor_id=100, reason="organizer closed rooms"
+        "lobby-1",
+        actor_id=100,
+        reason="organizer closed rooms",
+        outcome="cancelled",
     )
 
 
@@ -150,3 +155,44 @@ async def test_service_error_is_reported(room_service):
     await bot.party_room.callback(interaction, lobby_id="lobby-1", action="lock")
     reply = interaction.response.send_message.call_args.args[0]
     assert "not the organizer" in reply
+
+
+async def test_report_returns_guild_scoped_human_readable_embed(room_service):
+    report = MagicMock(
+        report_id="report-123",
+        lobby_id="lobby-12345678",
+        organizer_id=100,
+        participant_ids=(100, 200),
+        outcome=MagicMock(value="cancelled"),
+        close_reason="organizer closed rooms",
+        closed_at=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+    room_service.get_report.return_value = report
+    interaction = _interaction()
+    interaction.user.guild_permissions.manage_guild = False
+
+    await bot.party_report.callback(interaction, reference="lobby-12345678")
+
+    room_service.get_report.assert_awaited_once_with(
+        "lobby-12345678", guild_id=1, actor_id=100, is_staff=False
+    )
+    kwargs = interaction.response.send_message.call_args.kwargs
+    assert kwargs["ephemeral"] is True
+    assert kwargs["embed"].title == "Match room report"
+    assert "report-123" in kwargs["embed"].description
+    assert "```json" not in kwargs["embed"].description
+
+
+async def test_report_rejects_cross_guild_or_unauthorized_lookup(room_service):
+    room_service.get_report.side_effect = PermissionError(
+        "only the organizer or server staff can view this report"
+    )
+    interaction = _interaction(guild_id=2, user_id=200)
+    interaction.user.guild_permissions.manage_guild = False
+
+    await bot.party_report.callback(interaction, reference="report-123")
+
+    room_service.get_report.assert_awaited_once_with(
+        "report-123", guild_id=2, actor_id=200, is_staff=False
+    )
+    assert "organizer or server staff" in interaction.response.send_message.call_args.args[0]

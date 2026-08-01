@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-
 import discord
 
 
@@ -12,12 +10,14 @@ class DiscordMatchRoomOperations:
         self,
         guild: discord.Guild,
         category_id: int,
-        archive_channel_id: int,
+        archive_channel_id: int | None = None,
     ):
+        # Kept as an ignored compatibility argument for older adapters. New
+        # closures are database-first and never send archive payloads.
+        del archive_channel_id
         self.guild = guild
         self.guild_id = guild.id
         self.category_id = category_id
-        self.archive_channel_id = archive_channel_id
 
     async def resource_exists(self, resource_id: int) -> bool:
         return self.guild.get_channel(resource_id) is not None
@@ -205,18 +205,6 @@ class DiscordMatchRoomOperations:
         except discord.HTTPException:
             return "Discord could not move this player. Try again."
         return None
-
-    async def archive_summary(self, summary: dict) -> int | None:
-        channel = self.guild.get_channel(self.archive_channel_id)
-        if not isinstance(channel, discord.TextChannel):
-            raise RuntimeError("The GodForge Play archive channel is unavailable.")
-        message = await channel.send(
-            "GodForge room summary\n```json\n"
-            + json.dumps(summary, sort_keys=True, indent=2)
-            + "\n```",
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-        return message.id
 
     async def delete_resources(self, resource_ids: tuple[int, ...]) -> None:
         for resource_id in resource_ids:

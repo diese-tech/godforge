@@ -693,10 +693,19 @@ class PartyLobbyService:
                     await service.unlock(lobby.lobby_id, actor_id=interaction.user.id)
                     label = "unlocked"
                 else:
+                    changed = deps.party_repository.transition(
+                        guild_id,
+                        lobby_id,
+                        LobbyState.CANCELLED,
+                        operation_id=f"discord:{interaction.id}:room-close",
+                        actor_id=interaction.user.id,
+                    )
+                    await self.refresh_public_lobby_card(changed, interaction.guild)
                     await service.close(
                         lobby.lobby_id,
                         actor_id=interaction.user.id,
                         reason="organizer closed rooms",
+                        outcome="cancelled",
                     )
                     label = "closed"
             except (LookupError, PermissionError, ValueError, RuntimeError) as exc:

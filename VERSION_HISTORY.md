@@ -89,7 +89,9 @@ complete; live Discord and Railway validation remain before the stable tag.
   and player game-night statistics persist without a companion service.
 - **Temporary match rooms**: ready lobbies receive private coordination and
   optional team voice rooms with organizer-scoped controls, explicit voice-move
-  failures, restart reconciliation, summary archival, and grace-period cleanup.
+  failures, restart reconciliation, immutable SQLite closure reports, and
+  grace-period cleanup. `/party report` provides guild-scoped organizer/staff
+  retrieval without posting internal JSON to the Play channel.
 - **Role-complete team formation**: ready Conquest parties can launch through
   explicit role-fit, transparent balanced, or captain-draft modes. GodForge
   uses its own preferences and optional organizer inputs, reports unavoidable

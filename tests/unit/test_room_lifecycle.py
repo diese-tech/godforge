@@ -81,7 +81,9 @@ async def test_cleanup_closes_terminal_lobby_rooms_and_calls_cleanup_due():
     ctx = LifecycleContext(get_guild=lambda gid: None, guilds=(_guild(1),))
     await lifecycle.on_cleanup(ctx)
 
-    room_service.close.assert_awaited_once_with("lobby-1", reason="lobby cancelled")
+    room_service.close.assert_awaited_once_with(
+        "lobby-1", reason="lobby cancelled", outcome="cancelled"
+    )
     room_service.cleanup_due.assert_awaited_once()
 
 

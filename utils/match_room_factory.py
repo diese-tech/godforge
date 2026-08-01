@@ -29,8 +29,7 @@ class MatchRoomServiceFactory:
     def for_guild(self, guild) -> MatchRoomService:
         managed = self._settings_provider(str(guild.id))["managed"]
         category_id = int(managed.get("roomCategoryId") or 0)
-        archive_channel_id = int(managed.get("playChannelId") or 0)
-        if not category_id or not archive_channel_id:
+        if not category_id:
             raise RuntimeError("Run /party setup before creating temporary rooms.")
         grace = timedelta(
             minutes=TEST_MODE_GRACE_MINUTES
@@ -42,7 +41,6 @@ class MatchRoomServiceFactory:
             DiscordMatchRoomOperations(
                 guild,
                 category_id=category_id,
-                archive_channel_id=archive_channel_id,
             ),
             empty_grace=grace,
         )

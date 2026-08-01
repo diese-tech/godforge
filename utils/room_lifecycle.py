@@ -55,7 +55,9 @@ class RoomLifecycle:
                     lobby = self._party_repository.get(guild.id, rooms.lobby_id)
                     if lobby and lobby.is_terminal:
                         await room_service.close(
-                            rooms.lobby_id, reason=f"lobby {lobby.state.value}"
+                            rooms.lobby_id,
+                            reason=f"lobby {lobby.state.value}",
+                            outcome=lobby.state.value,
                         )
                 await room_service.cleanup_due()
             except Exception:

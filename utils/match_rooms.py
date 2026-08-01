@@ -86,7 +86,7 @@ class MatchRoomOperations(Protocol):
     ) -> None: ...
 
     async def move_from_lobby_voice(
-        self, user_id: int, lobby_voice_id: int, destination_id: int
+        self, user_id: int, lobby_voice_id: int | None, destination_id: int
     ) -> str | None: ...
 
     async def archive_summary(self, summary: dict) -> int | None: ...
@@ -370,7 +370,7 @@ class MatchRoomService:
         lobby_id: str,
         *,
         actor_id: int,
-        lobby_voice_id: int,
+        lobby_voice_id: int | None,
         team_assignments: dict[int, int],
     ) -> dict[int, str]:
         rooms = self._authorized(lobby_id, actor_id)

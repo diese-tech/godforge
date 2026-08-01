@@ -40,10 +40,24 @@ def register_party_room_command(
     )
     @app_commands.describe(
         lobby_id="Stable lobby ID shown on the lobby card",
-        action="lock, unlock, remove, transfer, move, or close",
+        action="Select a guided room action",
         member="Player used by remove, transfer, or move",
         lobby_voice="Configured source voice room for move",
         team="Destination team number for move",
+    )
+    @app_commands.choices(
+        action=[
+            app_commands.Choice(name="Lock", value="lock"),
+            app_commands.Choice(name="Unlock", value="unlock"),
+            app_commands.Choice(name="Remove Player", value="remove"),
+            app_commands.Choice(name="Transfer Organizer", value="transfer"),
+            app_commands.Choice(name="Move to Team", value="move"),
+            app_commands.Choice(name="Close Rooms", value="close"),
+        ],
+        team=[
+            app_commands.Choice(name="Team 1", value=1),
+            app_commands.Choice(name="Team 2", value=2),
+        ],
     )
     async def room(
         interaction: discord.Interaction,
@@ -119,8 +133,15 @@ def register_party_room_command(
                     ephemeral=True,
                 )
                 return
-        except (LookupError, PermissionError, ValueError, RuntimeError) as exc:
+        except (LookupError, PermissionError, ValueError) as exc:
             await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        except RuntimeError:
+            await interaction.response.send_message(
+                "GodForge could not complete that room action. Check the saved room "
+                "state and Discord permissions, then retry.",
+                ephemeral=True,
+            )
             return
         await interaction.response.send_message(
             f"Room action `{action}` completed for `{rooms.lobby_id[:8]}`.",

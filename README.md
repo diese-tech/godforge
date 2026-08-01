@@ -88,9 +88,10 @@ Important status notes:
 - The Play panel supports Create Lobby, Browse Lobbies, Join Queue, and My
   Preferences. Preference buttons update both Discord roles and durable
   GodForge player preferences.
-- Lobby creation captures mode, region, format, party size, voice requirement,
-  skill band, and notes. Reusable lobby cards support join, leave, edit, cancel,
-  and share actions without a web account.
+- Selection-based lobby creation captures mode, region, format, an even
+  capacity from 2 through 10, voice requirement, and skill band. Notes are the
+  only free-form modal field. Joining likewise uses constrained role, fill,
+  and captain selections.
 - Full lobbies use a durable ordered waitlist and automatically start a ready
   check. Players can answer Ready, Need 5 Minutes, or Drop; dropped seats use
   deterministic role-aware promotion without server-wide pings.
@@ -105,15 +106,15 @@ Important status notes:
   outcomes, and guild/team/player game-night history.
 - Game-night statistics cover appearances, wins, streaks, role frequency, and
   teammate frequency. They contain no economy, betting, or payout behavior.
-- A successful ready check creates a private coordination channel and optional
-  team voice rooms in the setup-managed category. `/party room` gives only the
-  lobby organizer scoped lock, unlock, remove, transfer, voice-move, and close
-  controls. Room records survive restarts, reconcile missing resources, archive
-  a summary, and remove empty voice rooms after a grace period.
-- After all ten players are ready, organizers choose Role Fit, Balanced, or
-  Captain Teams directly on the lobby card. Every result has one Solo, Jungle,
-  Mid, Support, and ADC per side and reports role satisfaction, unavoidable
-  fills, and the GodForge-owned strength difference before drafting continues.
+- A successful ready check creates a private match workspace and optional team
+  voice rooms. Persistent organizer controls recover after restart; `/party
+  room` also exposes Discord-recognized action choices for lock, unlock, remove,
+  transfer, move, and close without granting Manage Channels.
+- Ready rosters of 2, 4, 6, 8, or 10 form 1v1 through 5v5 teams in the private
+  workspace. Role Fit, Balanced, and Captain Teams prefer the documented
+  tank/DPS targets, report unavoidable fills, and retain one of each SMITE role
+  per side in 5v5 when feasible. Drafts and results stay private; the public
+  lobby card becomes a compact status projection.
 
 ## Architecture / System Flow
 

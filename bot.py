@@ -44,9 +44,10 @@ from utils.guild_setup import (
 from utils.managed_roles import ManagedRoleError, reconcile as reconcile_roles, set_member_role
 from utils.setup_views import PlayPanelView, RolePreferencesView
 from utils.lobby_views import (
-    CreateLobbyModal,
-    JoinPreferencesModal,
+    CreateLobbyWizardView,
+    JoinPreferencesView,
     LobbyCardView,
+    MatchFormationView,
     MatchContinuityView,
     MatchResultView,
     ReadyCheckView,
@@ -183,6 +184,7 @@ class GodForgeClient(discord.Client):
         self.add_view(RolePreferencesView(_handle_role_preference))
         self.add_view(LobbyCardView(_handle_lobby_card_action))
         self.add_view(ReadyCheckView(_handle_ready_check_action))
+        self.add_view(MatchFormationView(_handle_lobby_card_action))
         self.add_view(MatchResultView(_handle_match_result_action))
         self.add_view(MatchContinuityView(_handle_match_continuity_action))
         self.add_view(ScrimChallengeView())
@@ -984,9 +986,10 @@ _party_lobby_deps = PartyLobbyDeps(
     lobby_card_view=lambda: LobbyCardView(_handle_lobby_card_action),
     ready_check_view=lambda: ReadyCheckView(_handle_ready_check_action),
     role_preferences_view=lambda: RolePreferencesView(_handle_role_preference),
-    create_lobby_modal=CreateLobbyModal,
-    join_preferences_modal=JoinPreferencesModal,
+    create_lobby_view=CreateLobbyWizardView,
+    join_preferences_view=JoinPreferencesView,
     match_result_view=lambda: MatchResultView(_handle_match_result_action),
+    match_formation_view=lambda: MatchFormationView(_handle_lobby_card_action),
 )
 party_lobby_service = PartyLobbyService(_party_lobby_deps)
 feature_registry.register(PartyLobbyFeature(party_lobby_service))

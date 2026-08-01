@@ -26,6 +26,72 @@ def _load(filename: str) -> dict:
         return json.load(f)
 
 
+def _read_json(path: Path) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def validate_build_contract(data: dict) -> dict:
+    """Fail closed when generated build eligibility is ambiguous or unsafe."""
+    if data.get("schemaVersion") != 2:
+        raise ValueError("GodForge build schema version 2 is required.")
+    if data.get("contractVersion") != 2:
+        raise ValueError("GodForge build contract version 2 is required.")
+    source = data.get("source")
+    if not isinstance(source, dict) or "commit" not in source:
+        raise ValueError("GodForge build contract source metadata is missing.")
+    catalog = data.get("catalog")
+    if not isinstance(catalog, list) or not catalog:
+        raise ValueError("GodForge build catalog is missing or empty.")
+    if len(set(catalog)) != len(catalog):
+        raise ValueError("GodForge build catalog contains duplicate items.")
+    chaos = data.get("pools", {}).get("chaos")
+    if not isinstance(chaos, list) or not chaos:
+        raise ValueError("GodForge explicit chaos pool is missing or empty.")
+    if len(set(chaos)) != len(chaos):
+        raise ValueError("GodForge explicit chaos pool contains duplicate items.")
+    catalog_names = set(catalog)
+    unresolved = [item for item in chaos if item not in catalog_names]
+    if unresolved:
+        raise ValueError(
+            "GodForge chaos items do not resolve to the canonical catalog: "
+            + ", ".join(unresolved)
+        )
+    if set(chaos) == catalog_names:
+        raise ValueError(
+            "GodForge chaos eligibility must remain separate from the full catalog."
+        )
+    if data.get("all") != chaos:
+        raise ValueError(
+            "GodForge compatibility `all` must match the explicit chaos pool."
+        )
+    return data
+
+
+def _load_builds() -> dict:
+    primary_path = DATA_DIR / "builds.json"
+    fallback_path = STATIC_DATA_DIR / "builds.json"
+    if not primary_path.exists() and not fallback_path.exists():
+        raise FileNotFoundError(f"Data file not found: {primary_path}")
+
+    primary = (
+        validate_build_contract(_read_json(primary_path))
+        if primary_path.exists()
+        else None
+    )
+    fallback = (
+        validate_build_contract(_read_json(fallback_path))
+        if fallback_path.exists()
+        else None
+    )
+    if primary is not None and fallback is not None and primary != fallback:
+        raise ValueError(
+            "Primary and static GodForge build contracts do not match. "
+            "Regenerate both artifacts together."
+        )
+    return primary if primary is not None else fallback
+
+
 def gods() -> dict:
     global _gods_cache
     if _gods_cache is None:
@@ -36,7 +102,7 @@ def gods() -> dict:
 def builds() -> dict:
     global _builds_cache
     if _builds_cache is None:
-        _builds_cache = _load("builds.json")
+        _builds_cache = _load_builds()
     return _builds_cache
 
 

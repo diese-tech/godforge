@@ -142,14 +142,19 @@ def pick_build(builds_data: dict, role: str, build_type: str | None,
     """
     Pick `count` unique items for a build (default 6).
 
-    role:       "chaos" -> from full 'all' master list, type ignored
+    role:       "chaos" -> from explicit pools.chaos, type ignored
                 "support" -> from pools.support (no type)
                 "adc" -> from pools.adc[type]   (type: standard|str|hyb)
                 "mid"/"jungle"/"solo" -> from pools[role][type]
     """
     if role == "chaos":
-        pool = builds_data.get("all", [])
-        scope = "all"
+        pool = builds_data.get("pools", {}).get("chaos", [])
+        if not pool:
+            raise ValueError(
+                "The explicit chaos build pool is missing or empty. "
+                "Regenerate the GodForge content contract before using `.rc`."
+            )
+        scope = "chaos"
     else:
         pools = builds_data.get("pools", {})
         if role == "support":
@@ -168,7 +173,7 @@ def pick_build(builds_data: dict, role: str, build_type: str | None,
             pool = role_pools[build_type]
             scope = f"{role}/{build_type}"
 
-    unique_items = list(set(pool))
+    unique_items = list(dict.fromkeys(pool))
     if len(unique_items) < count:
         raise ValueError(
             f"Build pool '{scope}' has only {len(unique_items)} unique items "

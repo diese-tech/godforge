@@ -164,7 +164,7 @@ Default source is `website`. Explicit sources are `w` for website and `t` for ta
 
 | Command | Result |
 | --- | --- |
-| `.rc [1-5]` | Chaos build from the full item pool |
+| `.rc [1-5]` | Chaos build from the reviewed `pools.chaos` eligibility pool |
 | `.midint [1-5]`, `.midstr [1-5]` | Mid intelligence/strength builds |
 | `.jungint [1-5]`, `.jungstr [1-5]` | Jungle intelligence/strength builds |
 | `.soloint [1-5]`, `.solostr [1-5]`, `.solohyb [1-5]` | Solo builds |
@@ -289,7 +289,7 @@ GodForge does not require a separate database for the Discord bot. Runtime state
 | --- | --- |
 | `data/match_ids.json` | Orchestration match ID counter |
 | `data/gods.json` | God roster, pools, weights |
-| `data/builds.json` | Item/build pools |
+| `data/builds.json` | Versioned item catalog and explicit gameplay pools |
 | `data/aliases.json` | God aliases |
 | `data/custom_commands.json` | Dashboard custom command configs when JSON-backed |
 | `data/guild_settings.json` | Temporary dashboard guild settings when JSON-backed |
@@ -301,6 +301,14 @@ Dashboard document storage can optionally use SQLite:
 GODFORGE_STORAGE=sqlite
 GODFORGE_DB_PATH=/app/data/godforge_dashboard.db
 ```
+
+`data/builds.json` and `utils/static_data/builds.json` are generated together by
+`diese-tech/smite-content-sync` and must remain equivalent. Contract version 2
+keeps the complete discovery `catalog` separate from `pools.chaos`; the legacy
+`all` key is only an explicit compatibility alias for chaos eligibility. The
+loader fails closed on missing, unresolved, or mismatched artifacts. Because
+build data is cached in process, restart GodForge after deploying a regenerated
+contract before smoke-testing `.rc`.
 
 ## Environment Variables
 

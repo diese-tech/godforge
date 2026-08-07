@@ -24,7 +24,7 @@ Discord objects stay at this boundary; domain logic stays in
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Callable
 
@@ -68,9 +68,10 @@ class PartyLobbyDeps:
     lobby_card_view: Callable[[], discord.ui.View]
     ready_check_view: Callable[[], discord.ui.View]
     role_preferences_view: Callable[[], discord.ui.View]
-    create_lobby_modal: Callable[[Callable], discord.ui.Modal]
-    join_preferences_modal: Callable[[Callable], discord.ui.Modal]
+    create_lobby_view: Callable[..., discord.ui.View]
+    join_preferences_view: Callable[..., discord.ui.View]
     match_result_view: Callable[[], discord.ui.View]
+    match_formation_view: Callable[[], discord.ui.View] | None = None
 
 
 class PartyLobbyService:
@@ -103,6 +104,21 @@ class PartyLobbyService:
             ),
             inline=False,
         )
+        if lobby.state is LobbyState.FORMING:
+            embed.add_field(
+                name="Status",
+                value=(
+                    f"Match forming · {len(lobby.participants)}/{lobby.capacity} ready · "
+                    "Private room created"
+                ),
+                inline=False,
+            )
+        elif lobby.state is LobbyState.ACTIVE:
+            embed.add_field(
+                name="Status",
+                value="Match active · Draft and results are in the private room",
+                inline=False,
+            )
         embed.set_footer(text=f"lobby_id={lobby.lobby_id}")
         return embed
 
@@ -123,6 +139,106 @@ class PartyLobbyService:
             )
         embed.set_footer(text=f"lobby_id={lobby_id}")
         return embed
+
+    def formation_card_embed(self, lobby) -> discord.Embed:
+        embed = discord.Embed(
+            title="GodForge Match Formation",
+            description=(
+                f"All {len(lobby.participants)} players are ready. "
+                "The organizer can choose a deterministic team mode below."
+            ),
+            color=0x2ECC71,
+        )
+        embed.add_field(
+            name="Private match workspace",
+            value="Draft launch, team assignments, and results stay in this channel.",
+            inline=False,
+        )
+        if lobby.state is LobbyState.FORMING:
+            embed.add_field(
+                name="Status",
+                value=(
+                    f"Match forming · {len(lobby.participants)}/{lobby.capacity} ready · "
+                    "Private room created"
+                ),
+                inline=False,
+            )
+        elif lobby.state is LobbyState.ACTIVE:
+            embed.add_field(
+                name="Status",
+                value="Match active · Draft and results are in the private room",
+                inline=False,
+            )
+        embed.set_footer(text=f"lobby_id={lobby.lobby_id}")
+        return embed
+
+    async def ensure_match_formation_card(self, lobby, guild, rooms):
+        """Create or refresh the durable private formation control message."""
+        deps = self.deps
+        channel = guild.get_channel(rooms.text_room_id)
+        if channel is None or not hasattr(channel, "send"):
+            raise RuntimeError("The private match text channel is unavailable.")
+        delivery = lobby.delivery
+        if (
+            delivery.match_channel_id == rooms.text_room_id
+            and delivery.formation_message_id
+            and hasattr(channel, "fetch_message")
+        ):
+            try:
+                message = await channel.fetch_message(delivery.formation_message_id)
+                await message.edit(
+                    content=f"<@{lobby.organizer_id}> choose how to form this match.",
+                    embed=self.formation_card_embed(lobby),
+                    view=(
+                        deps.match_formation_view()
+                        if deps.match_formation_view
+                        else deps.lobby_card_view()
+                    ),
+                    allowed_mentions=discord.AllowedMentions(users=True, roles=False),
+                )
+                return lobby
+            except (discord.NotFound, discord.HTTPException, AttributeError):
+                pass
+        message = await channel.send(
+            content=f"<@{lobby.organizer_id}> choose how to form this match.",
+            embed=self.formation_card_embed(lobby),
+            view=(
+                deps.match_formation_view()
+                if deps.match_formation_view
+                else deps.lobby_card_view()
+            ),
+            allowed_mentions=discord.AllowedMentions(users=True, roles=False),
+        )
+        return deps.party_repository.set_delivery(
+            lobby.guild_id,
+            lobby.lobby_id,
+            replace(
+                lobby.delivery,
+                match_channel_id=rooms.text_room_id,
+                formation_message_id=message.id,
+            ),
+            operation_id=f"formation-delivery:{lobby.lobby_id}:{message.id}",
+        )
+
+    async def refresh_public_lobby_card(self, lobby, guild) -> None:
+        """Best-effort refresh of the shared public status projection."""
+        delivery = lobby.delivery
+        if not delivery.panel_channel_id or not delivery.panel_message_id:
+            return
+        channel = guild.get_channel(delivery.panel_channel_id)
+        if channel is None or not hasattr(channel, "fetch_message"):
+            return
+        try:
+            message = await channel.fetch_message(delivery.panel_message_id)
+            recruiting = lobby.state in {LobbyState.OPEN, LobbyState.FULL}
+            await message.edit(
+                embed=self.lobby_card_embed(lobby),
+                view=self.deps.lobby_card_view() if recruiting else None,
+            )
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException, AttributeError):
+            self.deps.log.exception(
+                "Could not refresh public lobby card %s", lobby.lobby_id
+            )
 
     @staticmethod
     def lobby_id_from_interaction(interaction: discord.Interaction) -> str:
@@ -224,8 +340,9 @@ class PartyLobbyService:
                 )
             return
         if action == "create":
-            await interaction.response.send_modal(
-                deps.create_lobby_modal(self.handle_create_lobby_submission)
+            view = deps.create_lobby_view(self.handle_create_lobby_submission)
+            await interaction.response.send_message(
+                embed=view.summary_embed(), view=view, ephemeral=True
             )
             return
         if action == "queue":
@@ -252,8 +369,10 @@ class PartyLobbyService:
                     payload,
                 )
 
-            await interaction.response.send_modal(
-                deps.join_preferences_modal(join_handler)
+            await interaction.response.send_message(
+                "Choose your lobby role preferences.",
+                view=deps.join_preferences_view(join_handler),
+                ephemeral=True,
             )
 
     async def handle_role_preference(
@@ -306,6 +425,13 @@ class PartyLobbyService:
         if guild_id is None:
             await interaction.response.send_message("Server-only action.", ephemeral=True)
             return
+        capacity = int(payload["party_size"])
+        if capacity not in {2, 4, 6, 8, 10}:
+            await interaction.response.send_message(
+                "Lobby capacity must be 2, 4, 6, 8, or 10 players.",
+                ephemeral=True,
+            )
+            return
         test_mode = deps.settings_module.get_guild_settings(str(guild_id))["managed"].get(
             "testMode",
             False,
@@ -313,7 +439,7 @@ class PartyLobbyService:
         lobby = deps.party_repository.create(
             guild_id=guild_id,
             organizer_id=interaction.user.id,
-            capacity=int(payload["party_size"]),
+            capacity=capacity,
             expires_at=datetime.now(timezone.utc)
             + timedelta(minutes=10 if test_mode else 120),
             operation_id=f"discord:{interaction.id}:create",
@@ -368,7 +494,11 @@ class PartyLobbyService:
         )
         lobby = deps.party_repository.get(guild_id, lobby_id)
         if lobby is None:
-            raise ValueError("lobby no longer exists")
+            await interaction.response.send_message(
+                "That lobby no longer exists. Browse lobbies and choose an active one.",
+                ephemeral=True,
+            )
+            return
         await self.ensure_party_queue(lobby)
         queue, destination = await deps.party_queue_service.join(
             lobby_id,
@@ -458,7 +588,11 @@ class PartyLobbyService:
             async def join_handler(join_interaction, payload):
                 await self.join_lobby_from_preferences(join_interaction, lobby_id, payload)
 
-            await interaction.response.send_modal(deps.join_preferences_modal(join_handler))
+            await interaction.response.send_message(
+                "Choose your lobby role preferences.",
+                view=deps.join_preferences_view(join_handler),
+                ephemeral=True,
+            )
             return
         if action == "leave":
             await self.ensure_party_queue(lobby)
@@ -544,6 +678,73 @@ class PartyLobbyService:
             "teams_balanced": FormationMode.BALANCED,
             "teams_captains": FormationMode.CAPTAINS,
         }
+        if action in {"room_lock", "room_unlock", "room_close"}:
+            if interaction.user.id != lobby.organizer_id:
+                await interaction.response.send_message(
+                    "Only the organizer can control these rooms.", ephemeral=True
+                )
+                return
+            service = deps.match_room_service_for_guild(interaction.guild)
+            try:
+                if action == "room_lock":
+                    await service.lock(lobby.lobby_id, actor_id=interaction.user.id)
+                    label = "locked"
+                elif action == "room_unlock":
+                    await service.unlock(lobby.lobby_id, actor_id=interaction.user.id)
+                    label = "unlocked"
+                else:
+                    await service.close(
+                        lobby.lobby_id,
+                        actor_id=interaction.user.id,
+                        reason="organizer closed rooms",
+                    )
+                    label = "closed"
+            except (LookupError, PermissionError, ValueError, RuntimeError) as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+            await interaction.response.send_message(
+                f"Private match rooms {label}.", ephemeral=True
+            )
+            return
+        if action == "move_teams_voice":
+            if interaction.user.id != lobby.organizer_id:
+                await interaction.response.send_message(
+                    "Only the organizer can move formed teams.", ephemeral=True
+                )
+                return
+            if not lobby.voice_required:
+                await interaction.response.send_message(
+                    "This lobby was created without team voice rooms.", ephemeral=True
+                )
+                return
+            launch = deps.party_draft_repository.get(lobby.lobby_id)
+            if launch is None or launch.status != "active":
+                await interaction.response.send_message(
+                    "Form and launch the teams before moving players to voice.",
+                    ephemeral=True,
+                )
+                return
+            assignments = {
+                **{user_id: 1 for user_id in launch.blue.participant_ids},
+                **{user_id: 2 for user_id in launch.red.participant_ids},
+            }
+            failures = await deps.match_room_service_for_guild(
+                interaction.guild
+            ).move_players(
+                lobby.lobby_id,
+                actor_id=interaction.user.id,
+                lobby_voice_id=None,
+                team_assignments=assignments,
+            )
+            moved = len(assignments) - len(failures)
+            message = f"{moved} moved to their saved team voice rooms."
+            if failures:
+                message += "\n" + "\n".join(
+                    f"<@{user_id}>: {error}"
+                    for user_id, error in sorted(failures.items())
+                )
+            await interaction.response.send_message(message, ephemeral=True)
+            return
         if action in formation_actions:
             await self.launch_party_draft(
                 interaction, lobby, formation_mode=formation_actions[action]
@@ -589,13 +790,57 @@ class PartyLobbyService:
                     ephemeral=True,
                 )
 
-            await interaction.response.send_modal(deps.create_lobby_modal(edit_handler))
+            initial = {
+                "mode": lobby.mode,
+                "region": lobby.region,
+                "format": lobby.format,
+                "party_size": lobby.capacity,
+                "voice_required": lobby.voice_required,
+                "skill_band": lobby.skill_band or "open",
+                "notes": lobby.notes,
+            }
+            view = deps.create_lobby_view(edit_handler, initial=initial)
+            await interaction.response.send_message(
+                embed=view.summary_embed(), view=view, ephemeral=True
+            )
             return
         if action == "share":
+            delivery = lobby.delivery
+            if delivery.panel_channel_id and delivery.panel_message_id:
+                existing_channel = interaction.guild.get_channel(
+                    delivery.panel_channel_id
+                )
+                if existing_channel is not None and hasattr(
+                    existing_channel, "fetch_message"
+                ):
+                    try:
+                        existing_message = await existing_channel.fetch_message(
+                            delivery.panel_message_id
+                        )
+                        await existing_message.edit(
+                            embed=self.lobby_card_embed(lobby),
+                            view=deps.lobby_card_view(),
+                        )
+                        await interaction.response.send_message(
+                            "Existing lobby share refreshed.", ephemeral=True
+                        )
+                        return
+                    except (discord.NotFound, discord.HTTPException, AttributeError):
+                        pass
             await interaction.response.send_message("Lobby shared.", ephemeral=True)
-            await interaction.channel.send(
+            message = await interaction.channel.send(
                 embed=self.lobby_card_embed(lobby),
                 view=deps.lobby_card_view(),
+            )
+            deps.party_repository.set_delivery(
+                guild_id,
+                lobby_id,
+                replace(
+                    lobby.delivery,
+                    panel_channel_id=interaction.channel.id,
+                    panel_message_id=message.id,
+                ),
+                operation_id=f"public-lobby-delivery:{lobby_id}:{message.id}",
             )
 
     # -- Draft launch ---------------------------------------------------------
@@ -648,10 +893,24 @@ class PartyLobbyService:
                 ephemeral=True,
             )
             return
-        channel = interaction.channel
-        if channel is None:
+        if interaction.guild is None:
             await interaction.response.send_message(
-                "Draft channel is unavailable.", ephemeral=True
+                "The private match channel is unavailable in this server.",
+                ephemeral=True,
+            )
+            return
+        room_service = deps.match_room_service_for_guild(interaction.guild)
+        rooms = await room_service.get(lobby.lobby_id)
+        channel = (
+            interaction.guild.get_channel(rooms.text_room_id)
+            if rooms is not None
+            else None
+        )
+        if channel is None or not hasattr(channel, "send"):
+            await interaction.response.send_message(
+                "The private match room is missing. Run `/party room` after GodForge "
+                "reconciles the room, then retry formation.",
+                ephemeral=True,
             )
             return
         if deps.channel_has_active(channel.id):
@@ -743,6 +1002,12 @@ class PartyLobbyService:
             draft_started = True
             match_record = deps.ensure_match_history(lobby, launch)
             self.reconcile_active_party_draft(lobby, launch, interaction.user.id)
+            active_lobby = deps.party_repository.get(lobby.guild_id, lobby.lobby_id)
+            if active_lobby is not None:
+                await self.ensure_match_formation_card(
+                    active_lobby, interaction.guild, rooms
+                )
+                await self.refresh_public_lobby_card(active_lobby, interaction.guild)
             formation = launch.snapshot.get("formation") or {}
             assignment_lines = []
             for side, emoji in (("blue", "🔵"), ("red", "🔴")):
@@ -779,7 +1044,7 @@ class PartyLobbyService:
                 f"Draft `{launch.match_id}` started. Teams and lobby rules are retained.",
                 ephemeral=True,
             )
-        except Exception as exc:
+        except Exception:
             if launch is not None and not draft_started:
                 deps.party_draft_repository.mark_failed(lobby.lobby_id, str(exc))
             deps.log.exception(
@@ -788,14 +1053,14 @@ class PartyLobbyService:
             if draft_started:
                 await interaction.followup.send(
                     f"Draft `{launch.match_id}` started, but GodForge could not refresh "
-                    "the lobby card. Press `Launch Draft` again to reconcile it safely. "
-                    + str(exc),
+                    "the lobby card. Press the same formation action again to reconcile "
+                    "it safely.",
                     ephemeral=True,
                 )
             else:
                 await interaction.followup.send(
                     "Draft launch failed. The lobby is still ready to retry with "
-                    "`Launch Draft`. " + str(exc),
+                    "the same private formation action.",
                     ephemeral=True,
                 )
 
@@ -856,6 +1121,24 @@ class PartyLobbyService:
             for member in queue.active
         )
         if everyone_ready:
+            active_count = len(queue.active)
+            if active_count % 2:
+                await interaction.response.edit_message(
+                    content=(
+                        "Odd rosters cannot enter formation. Wait for one player, "
+                        "drop one player, or use a substitute."
+                    ),
+                    embed=self.ready_check_embed(lobby_id, queue),
+                    view=deps.ready_check_view(),
+                )
+                return
+            if not 2 <= active_count <= 10:
+                await interaction.response.edit_message(
+                    content="Automatic formation supports 2, 4, 6, 8, or 10 active players.",
+                    embed=self.ready_check_embed(lobby_id, queue),
+                    view=deps.ready_check_view(),
+                )
+                return
             room_failure = None
             lobby = deps.party_repository.get(guild_id, lobby_id)
             if lobby and interaction.guild:
@@ -871,18 +1154,16 @@ class PartyLobbyService:
                         ),
                         create_team_voice=lobby.voice_required,
                     )
-                    room_channel = interaction.guild.get_channel(rooms.text_room_id)
-                    if isinstance(room_channel, discord.TextChannel):
-                        await room_channel.send(
-                            f"<@{lobby.organizer_id}> temporary coordination is ready. "
-                            f"Use `/party room` with lobby ID `{lobby_id}` to lock, "
-                            "unlock, remove, transfer, move, or close these rooms.",
-                            allowed_mentions=discord.AllowedMentions(
-                                users=True, roles=False
-                            ),
-                        )
+                    lobby = await self.ensure_match_formation_card(
+                        lobby, interaction.guild, rooms
+                    )
                 except (discord.Forbidden, discord.HTTPException, RuntimeError) as exc:
                     room_failure = str(exc)
+                except Exception:
+                    deps.log.exception(
+                        "Private match-room handoff failed for lobby %s", lobby_id
+                    )
+                    room_failure = "GodForge could not save the private-room handoff."
             if (
                 room_failure is None
                 and lobby
@@ -894,6 +1175,7 @@ class PartyLobbyService:
                     LobbyState.FORMING,
                     operation_id=f"discord:{interaction.id}:forming",
                 )
+                await self.refresh_public_lobby_card(lobby, interaction.guild)
             await interaction.response.edit_message(
                 content=(
                     "Everyone is ready. GodForge is forming the match."
@@ -916,6 +1198,30 @@ class PartyLobbyService:
             )
 
     # -- Ready-check expiry (periodic cleanup) -------------------------------
+
+    async def recover_match_controls(self, ctx: LifecycleContext) -> None:
+        """Reconcile private formation controls from lobby and room records."""
+        deps = self.deps
+        for record in deps.party_repository.recover_active():
+            lobby = record.lobby
+            if lobby.state not in {LobbyState.FORMING, LobbyState.ACTIVE}:
+                continue
+            guild = ctx.get_guild(lobby.guild_id)
+            if guild is None:
+                continue
+            try:
+                rooms = await deps.match_room_service_for_guild(guild).get(
+                    lobby.lobby_id
+                )
+                if rooms is None:
+                    continue
+                lobby = await self.ensure_match_formation_card(lobby, guild, rooms)
+                await self.refresh_public_lobby_card(lobby, guild)
+            except Exception:
+                deps.log.exception(
+                    "Private match-control recovery failed for lobby %s",
+                    lobby.lobby_id,
+                )
 
     async def expire_ready_checks(self, ctx: LifecycleContext) -> None:
         """Time out ready checks whose deadline has passed.
@@ -957,6 +1263,9 @@ class PartyLobbyFeature:
 
     def __init__(self, service: PartyLobbyService) -> None:
         self.service = service
+
+    async def on_startup(self, ctx: LifecycleContext) -> None:
+        await self.service.recover_match_controls(ctx)
 
     async def on_cleanup(self, ctx: LifecycleContext) -> None:
         await self.service.expire_ready_checks(ctx)

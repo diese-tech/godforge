@@ -112,12 +112,19 @@ def form_smite_teams(
     players: Iterable[FormationPlayer],
     mode: FormationMode | str = FormationMode.ROLE_FIT,
 ) -> FormationResult:
-    """Form two role-complete teams from exactly ten unique players."""
+    """Form equal teams from an even roster of two through ten players."""
     roster = tuple(sorted(players, key=lambda player: player.user_id))
     mode = FormationMode(mode)
-    if len(roster) != 10:
-        raise TeamFormationError("team formation requires exactly ten players")
-    if len({player.user_id for player in roster}) != 10:
+    if len(roster) % 2:
+        raise TeamFormationError(
+            "odd rosters cannot enter formation; wait for one player, drop one "
+            "player, or use a substitute"
+        )
+    if len(roster) < 2 or len(roster) > 10:
+        raise TeamFormationError(
+            "team formation requires an even roster from two through ten players"
+        )
+    if len({player.user_id for player in roster}) != len(roster):
         raise TeamFormationError("player IDs must be unique")
     if mode is FormationMode.CAPTAINS:
         return _captain_draft(roster)
@@ -128,10 +135,15 @@ def _optimized_split(
     roster: tuple[FormationPlayer, ...], mode: FormationMode
 ) -> FormationResult:
     by_id = {player.user_id: player for player in roster}
-    assignments: dict[frozenset[int], tuple[tuple[int, int, int], FormedTeam]] = {}
-    for members in combinations(roster, 5):
+    team_size = len(roster) // 2
+    assignments: dict[
+        frozenset[int], tuple[int, tuple[int, int, int], FormedTeam]
+    ] = {}
+    for members in combinations(roster, team_size):
         team = _best_role_assignment(members)
+        archetype_penalty = _archetype_penalty(team)
         assignments[frozenset(player.user_id for player in members)] = (
+            archetype_penalty,
             _fit_totals(team),
             team,
         )
@@ -139,29 +151,29 @@ def _optimized_split(
     all_ids = frozenset(by_id)
     captain_ids = {player.user_id for player in roster if player.captain}
     candidates = []
-    for blue_ids, (blue_fit, blue) in assignments.items():
+    for blue_ids, (blue_archetype, blue_fit, blue) in assignments.items():
         # The smallest player ID is always blue, removing mirrored duplicates.
         if min(all_ids) not in blue_ids:
             continue
-        red_fit, red = assignments[all_ids - blue_ids]
+        red_archetype, red_fit, red = assignments[all_ids - blue_ids]
+        archetype_penalty = blue_archetype + red_archetype
         fit = tuple(a + b for a, b in zip(blue_fit, red_fit))
         difference = abs(blue.strength - red.strength)
         captain_penalty = int(
             len(captain_ids) >= 2
             and (not captain_ids.intersection(blue_ids) or not captain_ids.intersection(all_ids - blue_ids))
         )
-        if mode is FormationMode.ROLE_FIT:
-            key = (fit, captain_penalty, difference, _identity_key(blue, red))
-        else:
-            # Every candidate is already role-complete. Balanced mode therefore
-            # minimizes the transparent strength difference, then uses role
-            # satisfaction and captain distribution as stable tie-breakers.
-            key = (
-                difference,
-                fit,
-                captain_penalty,
-                _identity_key(blue, red),
-            )
+        # Composition and role satisfaction remain ahead of the transparent
+        # GodForge-owned strength score. The selected mode remains part of the
+        # durable explanation; identical optimal inputs may intentionally yield
+        # the same teams in role-fit and balanced modes.
+        key = (
+            archetype_penalty,
+            fit,
+            captain_penalty,
+            difference,
+            _identity_key(blue, red),
+        )
         candidates.append((key, blue, red, fit, difference))
 
     _, blue, red, fit, difference = min(candidates, key=lambda item: item[0])
@@ -229,10 +241,11 @@ def _captain_pick_key(
 def _best_role_assignment(
     players: tuple[FormationPlayer, ...], *, captain_id: int | None = None
 ) -> FormedTeam:
-    if len(players) != 5:
-        raise TeamFormationError("each SMITE team requires five players")
+    if not 1 <= len(players) <= 5:
+        raise TeamFormationError("each SMITE team requires one through five players")
+    players = tuple(sorted(players, key=lambda player: player.user_id))
     candidates = []
-    for ordered in permutations(players):
+    for roles in permutations(SMITE_ROLES, len(players)):
         assignments = tuple(
             RoleAssignment(
                 player.user_id,
@@ -240,11 +253,18 @@ def _best_role_assignment(
                 _preference(player, role),
                 player.strength,
             )
-            for player, role in zip(ordered, SMITE_ROLES)
+            for player, role in zip(players, roles)
         )
         fit = _fit_totals_from_assignments(assignments)
-        candidates.append((fit, tuple(a.user_id for a in assignments), assignments))
-    _, _, best = min(candidates)
+        candidates.append(
+            (
+                _archetype_penalty_from_assignments(assignments),
+                fit,
+                tuple((a.user_id, a.role) for a in assignments),
+                assignments,
+            )
+        )
+    _, _, _, best = min(candidates)
     captain = captain_id or next(
         (
             assignment.user_id
@@ -266,6 +286,21 @@ def _preference(player: FormationPlayer, role: str) -> str:
 
 def _fit_totals(team: FormedTeam) -> tuple[int, int, int]:
     return _fit_totals_from_assignments(team.assignments)
+
+
+def _archetype_penalty(team: FormedTeam) -> int:
+    return _archetype_penalty_from_assignments(team.assignments)
+
+
+def _archetype_penalty_from_assignments(
+    assignments: tuple[RoleAssignment, ...],
+) -> int:
+    team_size = len(assignments)
+    target_tanks = {1: None, 2: 1, 3: 1, 4: 2, 5: 2}[team_size]
+    if target_tanks is None:
+        return 0
+    tanks = sum(assignment.role in {"solo", "support"} for assignment in assignments)
+    return abs(tanks - target_tanks)
 
 
 def _fit_totals_from_assignments(

@@ -15,6 +15,10 @@ import random
 DEFAULT_BUILD_SIZE = 6
 TEAM_SIZE = 5
 
+# SMITE 2 only has 3 active-item slots, so a chaos build can't actually be
+# equipped if more than 3 of its 6 items are "On Use" actives.
+MAX_ACTIVE_ITEMS_IN_CHAOS_BUILD = 3
+
 
 def pick_god(gods_data: dict, role: str | None, source: str,
              exclude: set | None = None) -> str:
@@ -137,6 +141,36 @@ def pick_team(gods_data: dict, role: str | None, source: str,
         return random.sample(candidates, TEAM_SIZE)
 
 
+def _sample_chaos_items(pool: list[str], active_names: set, count: int) -> list[str]:
+    """
+    Sample `count` unique items from `pool`, guaranteeing at most
+    MAX_ACTIVE_ITEMS_IN_CHAOS_BUILD of them are in `active_names`.
+
+    Rather than reject-and-retry, this splits the pool into active/inactive
+    halves up front and draws a valid split between them, so the invariant
+    holds for every call instead of just in expectation.
+    """
+    active_pool = [item for item in pool if item in active_names]
+    inactive_pool = [item for item in pool if item not in active_names]
+
+    max_actives = min(MAX_ACTIVE_ITEMS_IN_CHAOS_BUILD, count, len(active_pool))
+    min_actives = max(0, count - len(inactive_pool))
+    if min_actives > max_actives:
+        raise ValueError(
+            f"Cannot build a chaos pool of {count} items with at most "
+            f"{MAX_ACTIVE_ITEMS_IN_CHAOS_BUILD} active items: not enough "
+            "non-active items in the chaos pool."
+        )
+
+    num_actives = random.randint(min_actives, max_actives)
+    selected = (
+        random.sample(active_pool, num_actives)
+        + random.sample(inactive_pool, count - num_actives)
+    )
+    random.shuffle(selected)
+    return selected
+
+
 def pick_build(builds_data: dict, role: str, build_type: str | None,
                count: int = DEFAULT_BUILD_SIZE) -> list[str]:
     """
@@ -179,5 +213,9 @@ def pick_build(builds_data: dict, role: str, build_type: str | None,
             f"Build pool '{scope}' has only {len(unique_items)} unique items "
             f"(need at least {count})."
         )
+
+    if role == "chaos":
+        active_names = set(builds_data.get("activeItemNames", []))
+        return _sample_chaos_items(unique_items, active_names, count)
 
     return random.sample(unique_items, count)

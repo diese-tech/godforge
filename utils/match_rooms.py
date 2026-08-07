@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -19,6 +20,12 @@ class RoomState(StrEnum):
     CLOSING = "closing"
     CLOSED = "closed"
     ORPHANED = "orphaned"
+
+
+class RoomClosureOutcome(StrEnum):
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+    NO_CONTEST = "no_contest"
 
 
 class RoomPermissionError(PermissionError):
@@ -45,6 +52,19 @@ class MatchRooms:
             for resource_id in (self.text_room_id, *self.team_voice_ids)
             if resource_id is not None
         )
+
+
+@dataclass(frozen=True, slots=True)
+class RoomClosureReport:
+    report_id: str
+    guild_id: int
+    lobby_id: str
+    organizer_id: int
+    participant_ids: tuple[int, ...]
+    outcome: RoomClosureOutcome
+    close_reason: str
+    closed_at: datetime
+    created_at: datetime
 
 
 class MatchRoomOperations(Protocol):
@@ -89,8 +109,6 @@ class MatchRoomOperations(Protocol):
         self, user_id: int, lobby_voice_id: int | None, destination_id: int
     ) -> str | None: ...
 
-    async def archive_summary(self, summary: dict) -> int | None: ...
-
     async def delete_resources(self, resource_ids: tuple[int, ...]) -> None: ...
 
 
@@ -116,6 +134,20 @@ class SQLiteMatchRoomRepository:
                 );
                 CREATE INDEX IF NOT EXISTS party_match_rooms_cleanup
                   ON party_match_rooms(state,empty_since);
+                CREATE TABLE IF NOT EXISTS party_room_reports (
+                  report_id TEXT PRIMARY KEY,
+                  guild_id INTEGER NOT NULL,
+                  lobby_id TEXT NOT NULL,
+                  organizer_id INTEGER NOT NULL,
+                  participant_ids_json TEXT NOT NULL,
+                  outcome TEXT NOT NULL,
+                  close_reason TEXT NOT NULL,
+                  closed_at TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  UNIQUE(guild_id, lobby_id)
+                );
+                CREATE INDEX IF NOT EXISTS party_room_reports_guild_closed
+                  ON party_room_reports(guild_id, closed_at);
                 """
             )
 
@@ -159,33 +191,101 @@ class SQLiteMatchRoomRepository:
         now = _utc_now()
         rooms = replace(rooms, updated_at=now)
         with self._transaction() as conn:
+            self._save(conn, rooms)
+        return rooms
+
+    def begin_closure(
+        self,
+        rooms: MatchRooms,
+        *,
+        outcome: RoomClosureOutcome,
+        close_reason: str,
+    ) -> tuple[MatchRooms, RoomClosureReport]:
+        """Atomically persist closing intent and its immutable report."""
+        now = _utc_now()
+        closing = replace(
+            rooms,
+            state=RoomState.CLOSING,
+            empty_since=rooms.empty_since or now,
+            updated_at=now,
+        )
+        report_id = uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"godforge:room-report:{rooms.guild_id}:{rooms.lobby_id}",
+        ).hex
+        with self._transaction() as conn:
+            self._save(conn, closing)
             conn.execute(
-                """INSERT INTO party_match_rooms
-                   (lobby_id,guild_id,organizer_id,participant_ids_json,text_room_id,
-                    team_voice_ids_json,state,empty_since,archive_message_id,updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)
-                   ON CONFLICT(lobby_id) DO UPDATE SET
-                    guild_id=excluded.guild_id,organizer_id=excluded.organizer_id,
-                    participant_ids_json=excluded.participant_ids_json,
-                    text_room_id=excluded.text_room_id,
-                    team_voice_ids_json=excluded.team_voice_ids_json,state=excluded.state,
-                    empty_since=excluded.empty_since,
-                    archive_message_id=excluded.archive_message_id,
-                    updated_at=excluded.updated_at""",
+                """INSERT OR IGNORE INTO party_room_reports
+                   (report_id,guild_id,lobby_id,organizer_id,participant_ids_json,
+                    outcome,close_reason,closed_at,created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
                 (
-                    rooms.lobby_id,
+                    report_id,
                     rooms.guild_id,
+                    rooms.lobby_id,
                     rooms.organizer_id,
                     json.dumps(rooms.participant_ids),
-                    rooms.text_room_id,
-                    json.dumps(rooms.team_voice_ids),
-                    rooms.state,
-                    _encode_time(rooms.empty_since),
-                    rooms.archive_message_id,
+                    outcome,
+                    close_reason.strip() or "room closed",
+                    _encode_time(now),
                     _encode_time(now),
                 ),
             )
-        return rooms
+            row = conn.execute(
+                "SELECT * FROM party_room_reports WHERE guild_id=? AND lobby_id=?",
+                (rooms.guild_id, rooms.lobby_id),
+            ).fetchone()
+        return closing, self._decode_report(row)
+
+    def get_report(
+        self, guild_id: int, report_id_or_lobby_id: str
+    ) -> RoomClosureReport | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT * FROM party_room_reports
+                   WHERE guild_id=? AND (report_id=? OR lobby_id=?)""",
+                (guild_id, report_id_or_lobby_id, report_id_or_lobby_id),
+            ).fetchone()
+        return self._decode_report(row) if row else None
+
+    def reports(self, guild_id: int) -> tuple[RoomClosureReport, ...]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT * FROM party_room_reports WHERE guild_id=?
+                   ORDER BY closed_at, report_id""",
+                (guild_id,),
+            ).fetchall()
+        return tuple(self._decode_report(row) for row in rows)
+
+    @staticmethod
+    def _save(conn, rooms: MatchRooms) -> None:
+        conn.execute(
+            """INSERT INTO party_match_rooms
+               (lobby_id,guild_id,organizer_id,participant_ids_json,text_room_id,
+                team_voice_ids_json,state,empty_since,archive_message_id,updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(lobby_id) DO UPDATE SET
+                guild_id=excluded.guild_id,organizer_id=excluded.organizer_id,
+                participant_ids_json=excluded.participant_ids_json,
+                text_room_id=excluded.text_room_id,
+                team_voice_ids_json=excluded.team_voice_ids_json,state=excluded.state,
+                empty_since=excluded.empty_since,
+                archive_message_id=excluded.archive_message_id,
+                updated_at=excluded.updated_at""",
+            (
+                rooms.lobby_id,
+                rooms.guild_id,
+                rooms.organizer_id,
+                json.dumps(rooms.participant_ids),
+                rooms.text_room_id,
+                json.dumps(rooms.team_voice_ids),
+                rooms.state,
+                _encode_time(rooms.empty_since),
+                rooms.archive_message_id,
+                _encode_time(rooms.updated_at),
+            ),
+        )
 
     @staticmethod
     def _decode(row) -> MatchRooms:
@@ -200,6 +300,20 @@ class SQLiteMatchRoomRepository:
             empty_since=_decode_time(row["empty_since"]),
             archive_message_id=row["archive_message_id"],
             updated_at=_decode_time(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _decode_report(row) -> RoomClosureReport:
+        return RoomClosureReport(
+            report_id=row["report_id"],
+            guild_id=row["guild_id"],
+            lobby_id=row["lobby_id"],
+            organizer_id=row["organizer_id"],
+            participant_ids=tuple(json.loads(row["participant_ids_json"])),
+            outcome=RoomClosureOutcome(row["outcome"]),
+            close_reason=row["close_reason"],
+            closed_at=_decode_time(row["closed_at"]),
+            created_at=_decode_time(row["created_at"]),
         )
 
 
@@ -219,6 +333,23 @@ class MatchRoomService:
 
     async def get(self, lobby_id: str) -> MatchRooms | None:
         return self.repository.get(lobby_id)
+
+    async def get_report(
+        self,
+        report_id_or_lobby_id: str,
+        *,
+        guild_id: int,
+        actor_id: int,
+        is_staff: bool = False,
+    ) -> RoomClosureReport:
+        report = self.repository.get_report(guild_id, report_id_or_lobby_id)
+        if report is None:
+            raise LookupError("room report not found in this server")
+        if actor_id != report.organizer_id and not is_staff:
+            raise RoomPermissionError(
+                "only the organizer or server staff can view this report"
+            )
+        return report
 
     async def provision(
         self,
@@ -241,7 +372,7 @@ class MatchRoomService:
         if rooms.state is RoomState.CLOSED:
             return rooms
         if rooms.state is RoomState.CLOSING:
-            return await self._archive_and_delete(rooms, "resumed cleanup")
+            return await self._report_and_delete(rooms, "resumed cleanup")
         existence = [
             await self.operations.resource_exists(resource_id)
             for resource_id in rooms.resource_ids
@@ -406,12 +537,17 @@ class MatchRoomService:
         )
 
     async def close(
-        self, lobby_id: str, *, actor_id: int | None = None, reason: str = "closed"
+        self,
+        lobby_id: str,
+        *,
+        actor_id: int | None = None,
+        reason: str = "closed",
+        outcome: RoomClosureOutcome | str | None = None,
     ) -> MatchRooms:
         rooms = self._required(lobby_id)
         if actor_id is not None and actor_id != rooms.organizer_id:
             raise RoomPermissionError("only the lobby organizer can control rooms")
-        return await self._archive_and_delete(rooms, reason)
+        return await self._report_and_delete(rooms, reason, outcome=outcome)
 
     async def cleanup_due(
         self, *, now: datetime | None = None
@@ -424,7 +560,7 @@ class MatchRoomService:
                 and rooms.empty_since is not None
                 and current >= rooms.empty_since + self.empty_grace
             ):
-                await self._archive_and_delete(rooms, "empty room grace elapsed")
+                await self._report_and_delete(rooms, "empty room grace elapsed")
                 cleaned.append(rooms.lobby_id)
         return tuple(cleaned)
 
@@ -461,33 +597,24 @@ class MatchRoomService:
             )
         )
 
-    async def _archive_and_delete(
-        self, rooms: MatchRooms, reason: str
+    async def _report_and_delete(
+        self,
+        rooms: MatchRooms,
+        reason: str,
+        *,
+        outcome: RoomClosureOutcome | str | None = None,
     ) -> MatchRooms:
-        rooms = self.repository.save(
-            replace(rooms, state=RoomState.CLOSING, empty_since=rooms.empty_since or _utc_now())
+        rooms, _report = self.repository.begin_closure(
+            rooms,
+            outcome=_closure_outcome(outcome, reason),
+            close_reason=reason,
         )
-        summary = {
-            "lobby_id": rooms.lobby_id,
-            "guild_id": rooms.guild_id,
-            "organizer_id": rooms.organizer_id,
-            "participant_ids": list(rooms.participant_ids),
-            "reason": reason,
-            "closed_at": _encode_time(_utc_now()),
-        }
-        archive_id = rooms.archive_message_id
-        if archive_id is None:
-            archive_id = await self.operations.archive_summary(summary)
-            rooms = self.repository.save(
-                replace(rooms, archive_message_id=archive_id)
-            )
         await self.operations.delete_resources(rooms.resource_ids)
         return self.repository.save(
             replace(
                 rooms,
                 state=RoomState.CLOSED,
                 empty_since=None,
-                archive_message_id=archive_id,
             )
         )
 
@@ -511,6 +638,22 @@ def _utc(value: datetime | None) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("datetime must be timezone-aware")
     return value.astimezone(UTC)
+
+
+def _closure_outcome(
+    outcome: RoomClosureOutcome | str | None, reason: str
+) -> RoomClosureOutcome:
+    if outcome is not None:
+        normalized = str(outcome).strip().lower().replace(" ", "_")
+        if normalized == "expired":
+            normalized = RoomClosureOutcome.CANCELLED
+        return RoomClosureOutcome(normalized)
+    lowered = reason.lower()
+    if "complete" in lowered:
+        return RoomClosureOutcome.COMPLETED
+    if "cancel" in lowered or "organizer closed" in lowered or "expired" in lowered:
+        return RoomClosureOutcome.CANCELLED
+    return RoomClosureOutcome.NO_CONTEST
 
 
 def _utc_now() -> datetime:

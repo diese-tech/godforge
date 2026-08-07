@@ -852,9 +852,13 @@ party_setup = party_commands.setup
 _party_room_deps = PartyRoomCommandDeps(
     party_repository=party_repository,
     match_room_service_for_guild=_match_room_service_for_guild,
+    refresh_public_lobby_card=lambda lobby, guild: (
+        party_lobby_service.refresh_public_lobby_card(lobby, guild)
+    ),
 )
 register_party_room_command(party_commands, _party_room_deps)
 party_room = party_commands.room
+party_report = party_commands.report
 
 
 # Scheduled-night /party subcommands are owned by the schedule feature module

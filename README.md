@@ -115,6 +115,9 @@ Important status notes:
   tank/DPS targets, report unavoidable fills, and retain one of each SMITE role
   per side in 5v5 when feasible. Drafts and results stay private; the public
   lobby card becomes a compact status projection.
+- Closing a room writes one immutable, guild-scoped SQLite report before
+  Discord resources are removed. `/party report` returns that report privately
+  to its organizer or server staff; the Play channel never receives raw JSON.
 
 ## Architecture / System Flow
 
@@ -214,6 +217,7 @@ Party setup and temporary-room controls use Discord slash commands:
 | --- | --- |
 | `/party setup` | Provision the Play panel, managed roles, and room category |
 | `/party room` | Organizer-only temporary-room controls for one lobby |
+| `/party report` | Organizer/staff lookup for a guild-scoped room closure report |
 
 ## Setup
 

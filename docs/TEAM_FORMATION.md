@@ -37,6 +37,11 @@ team voice move stay in the private match channel. The shared Play card is only
 a compact status projection and is not required for progression. Saved private
 controls are reconciled on restart.
 
+Room closure is also database-first. GodForge stores one immutable report per
+guild/lobby before deleting temporary channels. Organizers and server staff can
+retrieve a human-readable summary with `/party report`; Discord delivery is not
+required for cleanup and the shared Play channel does not receive raw JSON.
+
 Strength is intentionally simple and explainable:
 
 ```text

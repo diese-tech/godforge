@@ -4,6 +4,8 @@ import pytest
 
 from utils.match_rooms import (
     MatchRoomService,
+    MatchRooms,
+    RoomClosureOutcome,
     RoomPermissionError,
     RoomState,
     SQLiteMatchRoomRepository,
@@ -245,7 +247,7 @@ async def test_voice_moves_report_per_player_failures(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_cleanup_archives_summary_before_deleting_after_grace(tmp_path):
+async def test_cleanup_saves_report_before_deleting_after_grace(tmp_path):
     now = datetime(2026, 7, 20, tzinfo=UTC)
     ops = FakeRooms()
     service = MatchRoomService(
@@ -266,7 +268,14 @@ async def test_cleanup_archives_summary_before_deleting_after_grace(tmp_path):
     cleaned = await service.cleanup_due(now=now + timedelta(minutes=5))
 
     assert cleaned == ("lobby",)
-    assert ops.archives[0]["lobby_id"] == "lobby"
+    report = service.repository.get_report(1, "lobby")
+    assert report is not None
+    assert report.lobby_id == "lobby"
+    assert report.organizer_id == 10
+    assert report.participant_ids == (10, 11)
+    assert report.outcome is RoomClosureOutcome.NO_CONTEST
+    assert report.close_reason == "empty room grace elapsed"
+    assert ops.archives == []
     assert all(resource_id not in ops.resources for resource_id in room.resource_ids)
     assert (await service.get("lobby")).state is RoomState.CLOSED
 
@@ -322,7 +331,9 @@ async def test_cleanup_due_only_processes_adapter_guild(tmp_path):
 
     assert await guild_one.cleanup_due(now=now) == ("one",)
     assert (await guild_two.get("two")).state is RoomState.CLOSING
-    assert guild_one_ops.archives[0]["guild_id"] == 1
+    assert repository.get_report(1, "one") is not None
+    assert repository.get_report(2, "one") is None
+    assert guild_one_ops.archives == []
 
 
 @pytest.mark.asyncio
@@ -341,8 +352,10 @@ async def test_restart_resumes_persisted_closing_intent_without_recreating(tmp_p
 
     interrupted = await service.get("lobby")
     assert interrupted.state is RoomState.CLOSING
-    assert interrupted.archive_message_id == 999
-    assert len(ops.archives) == 1
+    report = service.repository.get_report(1, "lobby")
+    assert report is not None
+    assert interrupted.archive_message_id is None
+    assert ops.archives == []
 
     ops.fail_delete = False
     created_before = ops.created
@@ -352,4 +365,51 @@ async def test_restart_resumes_persisted_closing_intent_without_recreating(tmp_p
 
     assert restored.state is RoomState.CLOSED
     assert ops.created == created_before
-    assert len(ops.archives) == 1
+    assert restored.archive_message_id is None
+    assert service.repository.get_report(1, "lobby") == report
+    assert len(service.repository.reports(1)) == 1
+
+
+@pytest.mark.asyncio
+async def test_report_lookup_is_guild_scoped_and_authorized(tmp_path):
+    repository = SQLiteMatchRoomRepository(tmp_path / "party.db")
+    service = MatchRoomService(repository, FakeRooms())
+    await service.provision(
+        guild_id=1,
+        lobby_id="lobby",
+        organizer_id=10,
+        participant_ids=(10, 11),
+        create_team_voice=False,
+    )
+    await service.close("lobby", actor_id=10, outcome=RoomClosureOutcome.CANCELLED)
+    saved = repository.get_report(1, "lobby")
+
+    assert saved == await service.get_report(
+        saved.report_id, guild_id=1, actor_id=10
+    )
+    assert saved == await service.get_report(
+        "lobby", guild_id=1, actor_id=99, is_staff=True
+    )
+    with pytest.raises(RoomPermissionError):
+        await service.get_report("lobby", guild_id=1, actor_id=11)
+    with pytest.raises(LookupError):
+        await service.get_report("lobby", guild_id=2, actor_id=10, is_staff=True)
+
+
+def test_existing_database_migrates_additively_and_keeps_archive_id(tmp_path):
+    path = tmp_path / "party.db"
+    repository = SQLiteMatchRoomRepository(path)
+    repository.save(
+        MatchRooms(
+            lobby_id="legacy",
+            guild_id=1,
+            organizer_id=10,
+            participant_ids=(10, 11),
+            archive_message_id=123,
+        )
+    )
+
+    reopened = SQLiteMatchRoomRepository(path)
+
+    assert reopened.get("legacy").archive_message_id == 123
+    assert reopened.get_report(1, "legacy") is None

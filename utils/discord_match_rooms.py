@@ -186,7 +186,7 @@ class DiscordMatchRoomOperations:
         return None
 
     async def move_from_lobby_voice(
-        self, user_id: int, lobby_voice_id: int, destination_id: int
+        self, user_id: int, lobby_voice_id: int | None, destination_id: int
     ) -> str | None:
         member = self.guild.get_member(user_id)
         destination = self.guild.get_channel(destination_id)
@@ -194,7 +194,7 @@ class DiscordMatchRoomOperations:
             return "Player or destination voice room is unavailable."
         if member.voice is None or member.voice.channel is None:
             return "Player is not connected to voice."
-        if member.voice.channel.id != lobby_voice_id:
+        if lobby_voice_id is not None and member.voice.channel.id != lobby_voice_id:
             return "Player is not in the configured lobby voice channel."
         if not destination.permissions_for(self.guild.me).move_members:
             return "GodForge needs Move Members in the temporary-room category."

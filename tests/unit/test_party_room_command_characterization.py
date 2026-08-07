@@ -46,6 +46,19 @@ def _interaction(*, guild_id=1, user_id=100):
     return interaction
 
 
+def test_room_action_is_a_discord_selection_not_free_form_text():
+    action = next(parameter for parameter in bot.party_room.parameters if parameter.name == "action")
+
+    assert [(choice.name, choice.value) for choice in action.choices] == [
+        ("Lock", "lock"),
+        ("Unlock", "unlock"),
+        ("Remove Player", "remove"),
+        ("Transfer Organizer", "transfer"),
+        ("Move to Team", "move"),
+        ("Close Rooms", "close"),
+    ]
+
+
 async def test_requires_guild():
     interaction = _interaction(guild_id=None)
     await bot.party_room.callback(interaction, lobby_id="lobby-1", action="lock")

@@ -46,6 +46,27 @@ def test_form_teams_spreads_volunteer_captains_deterministically():
     assert set(blue.participant_ids + red.participant_ids) == set(range(1, 11))
 
 
+def test_form_teams_supports_six_player_party_snapshot():
+    roles = ("solo", "mid", "adc") * 2
+    lobby = replace(
+        _ready_lobby(),
+        capacity=6,
+        participants=tuple(
+            Participant(
+                user_id,
+                primary_role=role,
+                captain=user_id in {1, 4},
+            )
+            for user_id, role in enumerate(roles, start=1)
+        ),
+    )
+
+    blue, red = form_teams(lobby)
+
+    assert len(blue.participant_ids) == len(red.participant_ids) == 3
+    assert set(blue.participant_ids + red.participant_ids) == set(range(1, 7))
+
+
 def test_form_teams_requires_ready_lobby():
     with pytest.raises(PartyDraftError, match="ready check"):
         form_teams(replace(_ready_lobby(), state=LobbyState.OPEN))

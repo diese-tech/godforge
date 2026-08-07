@@ -3,18 +3,16 @@
 from __future__ import annotations
 
 import logging
-import re
 from collections.abc import Awaitable, Callable
 
 import discord
 
 
-CREATE_MODAL_CUSTOM_ID = "godforge:lobby:create:v1"
-JOIN_MODAL_CUSTOM_ID = "godforge:lobby:join-preferences:v1"
 LOBBY_CARD_CUSTOM_ID_PREFIX = "godforge:lobby:card"
 READY_CHECK_CUSTOM_ID_PREFIX = "godforge:lobby:ready-check"
 MATCH_RESULT_CUSTOM_ID_PREFIX = "godforge:match:result"
 MATCH_CONTINUITY_CUSTOM_ID_PREFIX = "godforge:match:continuity"
+MATCH_FORMATION_CUSTOM_ID_PREFIX = "godforge:match:formation"
 
 LOBBY_CARD_ACTIONS = (
     ("join", "Join", discord.ButtonStyle.success),
@@ -49,12 +47,21 @@ MATCH_CONTINUITY_ACTIONS = (
     ("continue_series", "Continue Series", discord.ButtonStyle.success),
 )
 
+MATCH_FORMATION_ACTIONS = (
+    ("teams_role_fit", "Role Fit Teams", discord.ButtonStyle.success),
+    ("teams_balanced", "Balanced Teams", discord.ButtonStyle.success),
+    ("teams_captains", "Captain Teams", discord.ButtonStyle.primary),
+    ("move_teams_voice", "Move Teams to Voice", discord.ButtonStyle.secondary),
+    ("room_lock", "Lock Rooms", discord.ButtonStyle.secondary),
+    ("room_unlock", "Unlock Rooms", discord.ButtonStyle.secondary),
+    ("room_close", "Close Rooms", discord.ButtonStyle.danger),
+)
+
 ModalHandler = Callable[[discord.Interaction, dict[str, object]], Awaitable[None]]
 LobbyActionHandler = Callable[[discord.Interaction, str], Awaitable[None]]
 
 _LOGGER = logging.getLogger(__name__)
 _SAFE_ERROR = "GodForge could not complete that action. Please try again."
-_VALID_ROLES = {"solo", "jungle", "mid", "support", "adc", "fill"}
 
 
 async def _send_safe_error(
@@ -73,183 +80,309 @@ class _ValidationError(ValueError):
     pass
 
 
-def _required(value: str, label: str) -> str:
-    cleaned = value.strip()
-    if not cleaned:
-        raise _ValidationError(f"{label} is required.")
-    return cleaned
+_MODE_OPTIONS = (
+    ("Conquest", "conquest"),
+    ("Arena", "arena"),
+    ("Joust", "joust"),
+)
+_REGION_OPTIONS = (
+    ("NA East", "na east"),
+    ("NA West", "na west"),
+    ("Europe", "eu"),
+    ("Brazil", "brazil"),
+)
+_FORMAT_OPTIONS = (
+    ("Balanced PUG", "pug"),
+    ("Casual Custom", "casual custom"),
+    ("Captains Draft", "captains draft"),
+    ("Premade Scrim", "premade scrim"),
+)
+_ROLE_OPTIONS = tuple((role.title(), role) for role in ("solo", "jungle", "mid", "support", "adc"))
 
 
-def _yes_no(value: str, label: str) -> bool:
-    cleaned = value.strip().lower()
-    if cleaned in {"yes", "y", "true", "required", "1"}:
-        return True
-    if cleaned in {"no", "n", "false", "optional", "0"}:
-        return False
-    raise _ValidationError(f"{label} must be yes or no.")
+def _options(values, selected=None):
+    return [
+        discord.SelectOption(label=label, value=value, default=value == selected)
+        for label, value in values
+    ]
 
 
-class CreateLobbyModal(discord.ui.Modal):
-    """Collect lobby configuration within Discord's five-component limit.
-
-    Party size and voice preference share one compact input; optional skill band
-    and notes share another.  The handler still receives seven explicit fields.
-    """
-
-    def __init__(self, handler: ModalHandler) -> None:
+class _StateSelect(discord.ui.Select):
+    def __init__(self, owner, key: str, *, custom_id: str, placeholder: str, options, row: int):
         super().__init__(
-            title="Create a GodForge Lobby",
-            custom_id=CREATE_MODAL_CUSTOM_ID,
-            timeout=None,
+            custom_id=custom_id,
+            placeholder=placeholder,
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=row,
         )
-        self._handler = handler
-        self.mode = discord.ui.TextInput(
-            label="Mode",
-            custom_id="mode",
-            placeholder="Conquest, Arena, Joust...",
-            max_length=40,
+        self.owner = owner
+        self.key = key
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await self.owner.select(interaction, self.key, self.values[0])
+
+
+class _WizardButton(discord.ui.Button):
+    def __init__(self, owner, action: str, label: str, style, *, custom_id: str, row: int):
+        super().__init__(label=label, style=style, custom_id=custom_id, row=row)
+        self.owner = owner
+        self.action = action
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        try:
+            await self.owner.act(interaction, self.action)
+        except _ValidationError as exc:
+            await _send_safe_error(interaction, str(exc))
+        except Exception:
+            _LOGGER.exception("Lobby wizard action failed")
+            await _send_safe_error(interaction)
+
+
+class LobbyNotesModal(discord.ui.Modal):
+    """The only free-form input in lobby configuration."""
+
+    def __init__(self, owner) -> None:
+        super().__init__(
+            title="Lobby Notes",
+            custom_id="godforge:lobby:create:notes-modal:v2",
+            timeout=900,
         )
-        self.region = discord.ui.TextInput(
-            label="Region",
-            custom_id="region",
-            placeholder="NA East, EU, Brazil...",
-            max_length=40,
-        )
-        self.format = discord.ui.TextInput(
-            label="Format",
-            custom_id="format",
-            placeholder="PUG, scrim, custom night...",
-            max_length=40,
-        )
-        self.party_requirements = discord.ui.TextInput(
-            label="Party size / voice",
-            custom_id="party_requirements",
-            placeholder="10 / yes",
-            max_length=24,
-        )
-        self.optional_details = discord.ui.TextInput(
-            label="Optional skill band / notes",
-            custom_id="optional_details",
-            placeholder="Skill: mixed | Notes: chill games",
+        self.owner = owner
+        self.notes = discord.ui.TextInput(
+            label="Optional notes",
+            custom_id="notes",
             style=discord.TextStyle.paragraph,
             required=False,
             max_length=500,
+            default=str(owner.state.get("notes") or ""),
         )
-        for item in (
-            self.mode,
-            self.region,
-            self.format,
-            self.party_requirements,
-            self.optional_details,
-        ):
-            self.add_item(item)
-
-    def payload(self) -> dict[str, object]:
-        match = re.fullmatch(
-            r"\s*(\d{1,2})\s*(?:[/,|;-])\s*(.+?)\s*",
-            str(self.party_requirements),
-        )
-        if not match:
-            raise _ValidationError("Party size / voice must look like `10 / yes`.")
-        party_size = int(match.group(1))
-        if not 2 <= party_size <= 20:
-            raise _ValidationError("Party size must be between 2 and 20.")
-
-        details = str(self.optional_details).strip()
-        skill_band = ""
-        notes = ""
-        if details:
-            labeled = re.fullmatch(
-                r"\s*skill\s*:\s*(.*?)\s*(?:[|;\n]\s*notes\s*:\s*(.*))?\s*",
-                details,
-                flags=re.IGNORECASE | re.DOTALL,
-            )
-            if labeled:
-                skill_band = labeled.group(1).strip()
-                notes = (labeled.group(2) or "").strip()
-            else:
-                notes = details
-
-        return {
-            "mode": _required(str(self.mode), "Mode"),
-            "region": _required(str(self.region), "Region"),
-            "format": _required(str(self.format), "Format"),
-            "party_size": party_size,
-            "voice_required": _yes_no(match.group(2), "Voice requirement"),
-            "skill_band": skill_band or None,
-            "notes": notes or None,
-        }
+        self.add_item(self.notes)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        try:
-            await self._handler(interaction, self.payload())
-        except _ValidationError as exc:
-            await _send_safe_error(interaction, str(exc))
-        except Exception:
-            _LOGGER.exception("Create lobby modal handler failed")
-            await _send_safe_error(interaction)
-
-
-class JoinPreferencesModal(discord.ui.Modal):
-    """Collect a player's lobby-specific role and captain preferences."""
-
-    def __init__(self, handler: ModalHandler) -> None:
-        super().__init__(
-            title="Join Lobby",
-            custom_id=JOIN_MODAL_CUSTOM_ID,
-            timeout=None,
+        self.owner.state["notes"] = str(self.notes).strip()
+        await interaction.response.edit_message(
+            embed=self.owner.summary_embed(), view=self.owner
         )
+
+
+class CreateLobbyWizardView(discord.ui.View):
+    """Two-step constrained lobby configuration card."""
+
+    def __init__(self, handler: ModalHandler, initial: dict[str, object] | None = None) -> None:
+        super().__init__(timeout=900)
         self._handler = handler
-        self.primary_role = discord.ui.TextInput(
-            label="Primary role",
-            custom_id="primary_role",
-            placeholder="Solo, Jungle, Mid, Support, ADC",
-            max_length=16,
+        self.state = dict(initial or {})
+        self.page = 1
+        self._render()
+
+    def _render(self) -> None:
+        self.clear_items()
+        if self.page == 1:
+            selects = (
+                ("mode", "Mode", _MODE_OPTIONS),
+                ("region", "Region", _REGION_OPTIONS),
+                ("format", "Format", _FORMAT_OPTIONS),
+                ("party_size", "Total players", tuple((str(size), str(size)) for size in (2, 4, 6, 8, 10))),
+            )
+            for row, (key, label, values) in enumerate(selects):
+                selected = str(self.state.get(key, "")) or None
+                self.add_item(
+                    _StateSelect(
+                        self,
+                        key,
+                        custom_id=f"godforge:lobby:create:{'capacity' if key == 'party_size' else key}:v2",
+                        placeholder=label,
+                        options=_options(values, selected),
+                        row=row,
+                    )
+                )
+            self.add_item(
+                _WizardButton(
+                    self, "next", "Next", discord.ButtonStyle.primary,
+                    custom_id="godforge:lobby:create:next:v2", row=4,
+                )
+            )
+            self.add_item(
+                _WizardButton(
+                    self, "cancel", "Cancel", discord.ButtonStyle.secondary,
+                    custom_id="godforge:lobby:create:cancel:v2", row=4,
+                )
+            )
+            return
+        voice = "required" if self.state.get("voice_required") is True else (
+            "optional" if self.state.get("voice_required") is False else None
         )
-        self.secondary_role = discord.ui.TextInput(
-            label="Secondary role",
-            custom_id="secondary_role",
-            placeholder="Optional",
-            required=False,
-            max_length=16,
+        self.add_item(
+            _StateSelect(
+                self,
+                "voice_required",
+                custom_id="godforge:lobby:create:voice:v2",
+                placeholder="Voice requirement",
+                options=_options((("Required", "required"), ("Optional", "optional")), voice),
+                row=0,
+            )
         )
-        self.fill = discord.ui.TextInput(
-            label="Willing to fill?",
-            custom_id="fill",
-            placeholder="yes / no",
-            max_length=5,
+        skill_values = (
+            ("Open / Mixed", "open"),
+            ("Beginner", "beginner"),
+            ("Casual", "casual"),
+            ("Intermediate", "intermediate"),
+            ("Experienced", "experienced"),
+            ("Competitive", "competitive"),
         )
-        self.captain = discord.ui.TextInput(
-            label="Willing to captain?",
-            custom_id="captain",
-            placeholder="yes / no",
-            max_length=5,
+        self.add_item(
+            _StateSelect(
+                self,
+                "skill_band",
+                custom_id="godforge:lobby:create:skill:v2",
+                placeholder="Skill band",
+                options=_options(skill_values, self.state.get("skill_band")),
+                row=1,
+            )
         )
-        for item in (self.primary_role, self.secondary_role, self.fill, self.captain):
-            self.add_item(item)
+        for action, label, style, custom_id in (
+            ("notes", "Add Notes", discord.ButtonStyle.secondary, "notes"),
+            ("create", "Create Lobby", discord.ButtonStyle.success, "confirm"),
+            ("back", "Back", discord.ButtonStyle.secondary, "back"),
+            ("cancel", "Cancel", discord.ButtonStyle.danger, "cancel"),
+        ):
+            self.add_item(
+                _WizardButton(
+                    self, action, label, style,
+                    custom_id=f"godforge:lobby:create:{custom_id}:v2", row=2,
+                )
+            )
+
+    async def select(self, interaction: discord.Interaction, key: str, value: str) -> None:
+        if key == "party_size":
+            self.state[key] = int(value)
+        elif key == "voice_required":
+            self.state[key] = value == "required"
+        else:
+            self.state[key] = value
+        self._render()
+        await interaction.response.edit_message(embed=self.summary_embed(), view=self)
+
+    async def act(self, interaction: discord.Interaction, action: str) -> None:
+        if action == "cancel":
+            await interaction.response.edit_message(
+                content="Lobby configuration cancelled.", embed=None, view=None
+            )
+            return
+        if action == "next":
+            self._require(("mode", "region", "format", "party_size"))
+            self.page = 2
+            self._render()
+            await interaction.response.edit_message(embed=self.summary_embed(), view=self)
+            return
+        if action == "back":
+            self.page = 1
+            self._render()
+            await interaction.response.edit_message(embed=self.summary_embed(), view=self)
+            return
+        if action == "notes":
+            await interaction.response.send_modal(LobbyNotesModal(self))
+            return
+        if action == "create":
+            self._require(("mode", "region", "format", "party_size", "voice_required", "skill_band"))
+            await self._handler(interaction, self.payload())
 
     def payload(self) -> dict[str, object]:
-        primary = _required(str(self.primary_role), "Primary role").lower()
-        secondary = str(self.secondary_role).strip().lower()
-        if primary not in _VALID_ROLES:
-            raise _ValidationError("Primary role is not recognized.")
-        if secondary and secondary not in _VALID_ROLES:
-            raise _ValidationError("Secondary role is not recognized.")
         return {
-            "primary_role": primary,
-            "secondary_role": secondary or None,
-            "fill": _yes_no(str(self.fill), "Fill"),
-            "captain": _yes_no(str(self.captain), "Captain"),
+            "mode": self.state["mode"],
+            "region": self.state["region"],
+            "format": self.state["format"],
+            "party_size": int(self.state["party_size"]),
+            "voice_required": bool(self.state["voice_required"]),
+            "skill_band": self.state["skill_band"],
+            "notes": str(self.state.get("notes") or ""),
         }
 
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        try:
-            await self._handler(interaction, self.payload())
-        except _ValidationError as exc:
-            await _send_safe_error(interaction, str(exc))
-        except Exception:
-            _LOGGER.exception("Join preferences modal handler failed")
-            await _send_safe_error(interaction)
+    def _require(self, keys) -> None:
+        missing = [key.replace("_", " ") for key in keys if key not in self.state]
+        if missing:
+            raise _ValidationError("Choose " + ", ".join(missing) + " before continuing.")
+
+    def summary_embed(self) -> discord.Embed:
+        lines = [
+            f"Mode: **{self.state.get('mode', 'not selected')}**",
+            f"Region: **{self.state.get('region', 'not selected')}**",
+            f"Format: **{self.state.get('format', 'not selected')}**",
+            f"Players: **{self.state.get('party_size', 'not selected')}**",
+            "Voice: **"
+            + ("required" if self.state.get("voice_required") is True else "optional" if self.state.get("voice_required") is False else "not selected")
+            + "**",
+            f"Skill: **{self.state.get('skill_band', 'not selected')}**",
+        ]
+        if self.state.get("notes"):
+            lines.append(f"Notes: {self.state['notes']}")
+        return discord.Embed(
+            title=f"Create Lobby · Step {self.page} of 2",
+            description="\n".join(lines),
+            color=0x3498DB,
+        )
+
+
+class JoinPreferencesView(discord.ui.View):
+    """Constrained role, fill, and captain selections for joining a lobby."""
+
+    def __init__(self, handler: ModalHandler, initial: dict[str, object] | None = None) -> None:
+        super().__init__(timeout=900)
+        self._handler = handler
+        self.state = dict(initial or {})
+        definitions = (
+            ("primary_role", "primary", "Primary role", _ROLE_OPTIONS),
+            ("secondary_role", "secondary", "Secondary role", (("None", "none"), *_ROLE_OPTIONS)),
+            ("fill", "fill", "Willing to fill?", (("Yes", "yes"), ("No", "no"))),
+            ("captain", "captain", "Willing to captain?", (("Yes", "yes"), ("No", "no"))),
+        )
+        for row, (key, custom_key, label, values) in enumerate(definitions):
+            self.add_item(
+                _StateSelect(
+                    self,
+                    key,
+                    custom_id=f"godforge:lobby:join:{custom_key}:v2",
+                    placeholder=label,
+                    options=_options(values),
+                    row=row,
+                )
+            )
+        self.add_item(
+            _WizardButton(
+                self, "confirm", "Join Lobby", discord.ButtonStyle.success,
+                custom_id="godforge:lobby:join:confirm:v2", row=4,
+            )
+        )
+        self.add_item(
+            _WizardButton(
+                self, "cancel", "Cancel", discord.ButtonStyle.secondary,
+                custom_id="godforge:lobby:join:cancel:v2", row=4,
+            )
+        )
+
+    async def select(self, interaction: discord.Interaction, key: str, value: str) -> None:
+        if key == "secondary_role":
+            self.state[key] = None if value == "none" else value
+        elif key in {"fill", "captain"}:
+            self.state[key] = value == "yes"
+        else:
+            self.state[key] = value
+        await interaction.response.edit_message(view=self)
+
+    async def act(self, interaction: discord.Interaction, action: str) -> None:
+        if action == "cancel":
+            await interaction.response.edit_message(
+                content="Lobby join cancelled.", view=None
+            )
+            return
+        missing = [key for key in ("primary_role", "secondary_role", "fill", "captain") if key not in self.state]
+        if missing:
+            raise _ValidationError("Complete every role and availability selection first.")
+        if self.state["primary_role"] == self.state["secondary_role"]:
+            raise _ValidationError("Primary and secondary roles must be different.")
+        await self._handler(interaction, dict(self.state))
 
 
 class _LobbyActionButton(discord.ui.Button):
@@ -311,6 +444,24 @@ class ReadyCheckView(discord.ui.View):
                     handler,
                     custom_id_prefix=READY_CHECK_CUSTOM_ID_PREFIX,
                     row=0,
+                )
+            )
+
+
+class MatchFormationView(discord.ui.View):
+    """Persistent organizer controls hosted by the private match channel."""
+
+    def __init__(self, handler: LobbyActionHandler) -> None:
+        super().__init__(timeout=None)
+        for index, (action, label, style) in enumerate(MATCH_FORMATION_ACTIONS):
+            self.add_item(
+                _LobbyActionButton(
+                    action,
+                    label,
+                    style,
+                    handler,
+                    custom_id_prefix=MATCH_FORMATION_CUSTOM_ID_PREFIX,
+                    row=0 if index < 4 else 1,
                 )
             )
 

@@ -74,26 +74,27 @@ complete; live Discord and Railway validation remain before the stable tag.
 - **Managed role cosmetics**: permissionless role cosmetics and restart-safe
   self-assignment buttons project durable GodForge player preferences onto
   Discord roles without adopting same-named administrator roles.
-- **Reusable lobby cards**: Discord modals capture lobby rules and structured
-  role preferences; persistent cards support joining, leaving, organizer edits,
-  cancellation, and sharing while retaining state across restarts.
+- **Guided lobby cards**: constrained Discord selects capture lobby rules,
+  even capacities from 2 through 10, structured role preferences, fill, and
+  captain willingness. Only optional notes remain free-form.
 - **Reliable ready rosters**: concurrency-safe capacity, durable waitlists,
   role-aware substitute promotion, bounded ready-check extensions, and timeout
   cancellation survive process restarts.
-- **Ready-to-draft handoff**: organizers launch the existing local or
-  Activity-backed fearless draft from a ready lobby without re-entering
-  captains, participants, roles, or rules; durable launch intents make retries
-  safe and failures recoverable.
+- **Ready-to-draft handoff**: persistent private-channel controls form teams and
+  launch the local or Activity-backed draft without depending on an older lobby
+  card. Private controls, launch channel identity, and public status projections
+  recover from durable records.
 - **Standalone results and history**: captain-confirmed winners, organizer
   dispute resolution, explicit cancelled/no-contest records, and guild, team,
   and player game-night statistics persist without a companion service.
 - **Temporary match rooms**: ready lobbies receive private coordination and
   optional team voice rooms with organizer-scoped controls, explicit voice-move
   failures, restart reconciliation, summary archival, and grace-period cleanup.
-- **Role-complete team formation**: ready Conquest parties can launch through
-  explicit role-fit, transparent balanced, or captain-draft modes. GodForge
-  uses its own preferences and optional organizer inputs, reports unavoidable
-  fills and strength difference, and stores the explanation with the match.
+- **Variable team formation**: even rosters from 2 through 10 launch 1v1 through
+  5v5 through role-fit, transparent balanced, or captain modes. GodForge
+  targets tank/DPS composition, preserves one-of-each-role 5v5 when feasible,
+  reports unavoidable fills and per-player voice-move failures, and stores the
+  explanation with the match.
 - **Scheduled custom nights**: one-time and weekly events confirm an explicit
   timezone, retain role-aware RSVPs and waitlists, send durable reminders,
   export portable ICS files, and convert idempotently into the existing lobby

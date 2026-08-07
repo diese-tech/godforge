@@ -1,17 +1,17 @@
 from unittest.mock import AsyncMock, Mock
 
+import discord
 import pytest
 
 from utils.lobby_views import (
-    CREATE_MODAL_CUSTOM_ID,
-    JOIN_MODAL_CUSTOM_ID,
     LOBBY_CARD_ACTIONS,
     LOBBY_CARD_CUSTOM_ID_PREFIX,
     READY_CHECK_ACTIONS,
     READY_CHECK_CUSTOM_ID_PREFIX,
-    CreateLobbyModal,
-    JoinPreferencesModal,
+    CreateLobbyWizardView,
+    JoinPreferencesView,
     LobbyCardView,
+    MatchFormationView,
     MatchResultView,
     ReadyCheckView,
 )
@@ -21,107 +21,113 @@ def _interaction(response_done=False):
     interaction = Mock()
     interaction.response.is_done.return_value = response_done
     interaction.response.send_message = AsyncMock()
+    interaction.response.edit_message = AsyncMock()
+    interaction.response.send_modal = AsyncMock()
     interaction.followup.send = AsyncMock()
     return interaction
 
 
-def _set(input_item, value):
-    input_item._value = value
+def test_create_wizard_uses_only_constrained_controls_for_configuration():
+    view = CreateLobbyWizardView(AsyncMock())
+
+    assert [item.custom_id for item in view.children] == [
+        "godforge:lobby:create:mode:v2",
+        "godforge:lobby:create:region:v2",
+        "godforge:lobby:create:format:v2",
+        "godforge:lobby:create:capacity:v2",
+        "godforge:lobby:create:next:v2",
+        "godforge:lobby:create:cancel:v2",
+    ]
+    capacity = view.children[3]
+    assert [option.value for option in capacity.options] == ["2", "4", "6", "8", "10"]
+    assert all(not isinstance(item, type(discord.ui.TextInput(label="x"))) for item in view.children)
 
 
-def test_create_modal_is_persistent_and_respects_five_component_limit():
-    modal = CreateLobbyModal(AsyncMock())
+def test_join_wizard_exposes_role_and_boolean_selections_without_text_inputs():
+    view = JoinPreferencesView(AsyncMock())
 
-    assert modal.timeout is None
-    assert modal.custom_id == CREATE_MODAL_CUSTOM_ID
-    assert len(modal.children) == 5
-    assert [item.custom_id for item in modal.children] == [
-        "mode",
-        "region",
-        "format",
-        "party_requirements",
-        "optional_details",
+    assert [item.custom_id for item in view.children] == [
+        "godforge:lobby:join:primary:v2",
+        "godforge:lobby:join:secondary:v2",
+        "godforge:lobby:join:fill:v2",
+        "godforge:lobby:join:captain:v2",
+        "godforge:lobby:join:confirm:v2",
+        "godforge:lobby:join:cancel:v2",
+    ]
+
+
+def test_private_match_controls_are_persistent_and_include_room_recovery_actions():
+    view = MatchFormationView(AsyncMock())
+
+    assert view.timeout is None
+    assert [item.custom_id for item in view.children] == [
+        "godforge:match:formation:teams_role_fit:v1",
+        "godforge:match:formation:teams_balanced:v1",
+        "godforge:match:formation:teams_captains:v1",
+        "godforge:match:formation:move_teams_voice:v1",
+        "godforge:match:formation:room_lock:v1",
+        "godforge:match:formation:room_unlock:v1",
+        "godforge:match:formation:room_close:v1",
     ]
 
 
 @pytest.mark.asyncio
-async def test_create_modal_delegates_seven_explicit_fields():
+async def test_create_wizard_delegates_a_complete_constrained_payload_once():
     handler = AsyncMock()
-    modal = CreateLobbyModal(handler)
-    _set(modal.mode, "Conquest")
-    _set(modal.region, "NA East")
-    _set(modal.format, "PUG")
-    _set(modal.party_requirements, "10 / yes")
-    _set(modal.optional_details, "Skill: mixed | Notes: chill games")
+    view = CreateLobbyWizardView(
+        handler,
+        initial={
+            "mode": "conquest",
+            "region": "na east",
+            "format": "pug",
+            "party_size": 6,
+            "voice_required": True,
+            "skill_band": "intermediate",
+            "notes": "chill games",
+        },
+    )
     interaction = _interaction()
 
-    await modal.on_submit(interaction)
+    await view.act(interaction, "create")
 
     handler.assert_awaited_once_with(
         interaction,
         {
-            "mode": "Conquest",
-            "region": "NA East",
-            "format": "PUG",
-            "party_size": 10,
+            "mode": "conquest",
+            "region": "na east",
+            "format": "pug",
+            "party_size": 6,
             "voice_required": True,
-            "skill_band": "mixed",
+            "skill_band": "intermediate",
             "notes": "chill games",
         },
     )
 
 
 @pytest.mark.asyncio
-async def test_create_modal_validation_is_safe_and_actionable():
+async def test_join_wizard_rejects_duplicate_roles_and_cancel_is_safe():
     handler = AsyncMock()
-    modal = CreateLobbyModal(handler)
-    _set(modal.mode, "Conquest")
-    _set(modal.region, "EU")
-    _set(modal.format, "PUG")
-    _set(modal.party_requirements, "many")
-    interaction = _interaction()
-
-    await modal.on_submit(interaction)
-
-    handler.assert_not_awaited()
-    message = interaction.response.send_message.await_args.args[0]
-    assert "10 / yes" in message
-    assert interaction.response.send_message.await_args.kwargs == {"ephemeral": True}
-
-
-def test_join_modal_has_stable_id_and_four_fields():
-    modal = JoinPreferencesModal(AsyncMock())
-
-    assert modal.timeout is None
-    assert modal.custom_id == JOIN_MODAL_CUSTOM_ID
-    assert [item.custom_id for item in modal.children] == [
-        "primary_role",
-        "secondary_role",
-        "fill",
-        "captain",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_join_preferences_are_normalized_and_delegated():
-    handler = AsyncMock()
-    modal = JoinPreferencesModal(handler)
-    _set(modal.primary_role, "Jungle")
-    _set(modal.secondary_role, "Mid")
-    _set(modal.fill, "yes")
-    _set(modal.captain, "no")
-    interaction = _interaction()
-
-    await modal.on_submit(interaction)
-
-    handler.assert_awaited_once_with(
-        interaction,
-        {
-            "primary_role": "jungle",
+    view = JoinPreferencesView(
+        handler,
+        initial={
+            "primary_role": "mid",
             "secondary_role": "mid",
-            "fill": True,
+            "fill": False,
             "captain": False,
         },
+    )
+    interaction = _interaction()
+
+    await view.children[4].callback(interaction)
+
+    handler.assert_not_awaited()
+    assert "must be different" in interaction.response.send_message.await_args.args[0]
+
+    cancelled = JoinPreferencesView(handler)
+    cancel_interaction = _interaction()
+    await cancelled.children[5].callback(cancel_interaction)
+    cancel_interaction.response.edit_message.assert_awaited_once_with(
+        content="Lobby join cancelled.", view=None
     )
 
 

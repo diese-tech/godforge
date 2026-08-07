@@ -101,6 +101,8 @@ class DiscordDelivery:
     panel_message_id: int | None = None
     voice_channel_id: int | None = None
     team_channel_ids: tuple[int, ...] = ()
+    match_channel_id: int | None = None
+    formation_message_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -708,6 +708,8 @@ class SQLitePartyRepository:
                 panel_message_id=delivery.get("panel_message_id"),
                 voice_channel_id=delivery.get("voice_channel_id"),
                 team_channel_ids=tuple(delivery.get("team_channel_ids", ())),
+                match_channel_id=delivery.get("match_channel_id"),
+                formation_message_id=delivery.get("formation_message_id"),
             ),
             created_at=_decode_time(row["created_at"]),
             updated_at=_decode_time(row["updated_at"]),
@@ -725,6 +727,8 @@ class SQLitePartyRepository:
                 "panel_message_id": delivery.panel_message_id,
                 "voice_channel_id": delivery.voice_channel_id,
                 "team_channel_ids": list(delivery.team_channel_ids),
+                "match_channel_id": delivery.match_channel_id,
+                "formation_message_id": delivery.formation_message_id,
             },
             separators=(",", ":"), sort_keys=True,
         )

@@ -13,6 +13,11 @@ _gods_cache = None
 _builds_cache = None
 _aliases_cache = None
 
+# v2: no active-item data. v3 adds activeItemNames/relicItemNames; consumers
+# that don't know about them (e.g. picker.pick_build for non-chaos roles)
+# are unaffected either way.
+SUPPORTED_BUILD_CONTRACT_VERSIONS = (2, 3)
+
 
 def _load(filename: str) -> dict:
     path = DATA_DIR / filename
@@ -35,8 +40,12 @@ def validate_build_contract(data: dict) -> dict:
     """Fail closed when generated build eligibility is ambiguous or unsafe."""
     if data.get("schemaVersion") != 2:
         raise ValueError("GodForge build schema version 2 is required.")
-    if data.get("contractVersion") != 2:
-        raise ValueError("GodForge build contract version 2 is required.")
+    if data.get("contractVersion") not in SUPPORTED_BUILD_CONTRACT_VERSIONS:
+        raise ValueError(
+            "GodForge build contract version "
+            + " or ".join(str(v) for v in SUPPORTED_BUILD_CONTRACT_VERSIONS)
+            + " is required."
+        )
     source = data.get("source")
     if not isinstance(source, dict) or "commit" not in source:
         raise ValueError("GodForge build contract source metadata is missing.")

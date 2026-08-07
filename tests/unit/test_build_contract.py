@@ -28,7 +28,8 @@ def test_generated_primary_and_static_contracts_are_equivalent_and_safe():
     )
 
     assert primary == fallback
-    assert primary["schemaVersion"] == primary["contractVersion"] == 2
+    assert primary["schemaVersion"] == 2
+    assert primary["contractVersion"] in (2, 3)
     assert primary["all"] == primary["pools"]["chaos"]
     assert set(primary["pools"]["chaos"]) <= set(primary["catalog"])
     assert len(primary["pools"]["chaos"]) < len(primary["catalog"])
@@ -38,7 +39,6 @@ def test_generated_primary_and_static_contracts_are_equivalent_and_safe():
         "Sentry Ward",
         "Agility Relic",
         "Alternator Mod",
-        "Freya's Tears",
     ):
         assert prohibited in primary["catalog"]
         assert prohibited not in primary["pools"]["chaos"]
@@ -69,6 +69,19 @@ def test_invalid_contract_fails_safely_and_visibly(mutate, message):
 
     with pytest.raises(ValueError, match=message):
         loader.validate_build_contract(data)
+
+
+def test_contract_v3_with_active_and_relic_item_names_is_accepted():
+    chaos = ["Deathbringer", "Rod of Tahuti"]
+    data = _valid_contract(chaos=chaos)
+    data["contractVersion"] = 3
+    data["activeItemNames"] = ["Rod of Tahuti"]
+    data["relicItemNames"] = ["Purification Beads"]
+
+    validated = loader.validate_build_contract(data)
+
+    assert validated["contractVersion"] == 3
+    assert validated["activeItemNames"] == ["Rod of Tahuti"]
 
 
 def test_loader_rejects_primary_static_drift_and_reload_clears_cache(

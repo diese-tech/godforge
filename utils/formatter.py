@@ -243,7 +243,7 @@ def format_help_page1() -> discord.Embed:
         "`.soloint` / `.solostr` / `.solohyb`\n"
         "`.adc` / `.adcstr` / `.adchyb`\n"
         "`.sup` — support\n"
-        "`.rc` — chaos (full pool)"
+        "`.rc` — chaos (reviewed item pool)"
     ), inline=False)
 
     embed.add_field(name="Sessions  (track picks, prevent duplicates)", value=(

@@ -1,7 +1,7 @@
 # GodForge Web Data Contract
 
 This document covers the supported standalone web surface in
-`v2.3.0-rc.2`. Detailed migration-era economy contracts are archived at
+`v2.3.0-rc.3`. Detailed migration-era economy contracts are archived at
 [`../docs/archive/LEGACY_WEB_DATA_CONTRACT.md`](../docs/archive/LEGACY_WEB_DATA_CONTRACT.md).
 
 ## Public utilities

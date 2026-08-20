@@ -11,7 +11,7 @@ custom command configs persist to JSON by default, or to SQLite when
 `GODFORGE_STORAGE=sqlite` is enabled. Current gaps are tracked in `TODO.md`.
 
 Product-level release milestones are tracked in `../VERSION_HISTORY.md`.
-GodForge `v2.3.0-rc.2` establishes the standalone product boundary; the web
+GodForge `v2.3.0-rc.3` establishes the standalone product boundary; the web
 surface supports standalone utility, draft, settings, and command workflows.
 
 Release process details live in `../RELEASE_PROCESS.md`. The bot-visible version is controlled by `GODFORGE_VERSION` in `../utils/formatter.py` and appears at the bottom of `.help`.

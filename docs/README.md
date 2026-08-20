@@ -7,6 +7,8 @@ Use these files as the canonical sources:
 
 - [`STANDALONE_PRODUCT_PLAN.md`](STANDALONE_PRODUCT_PLAN.md) — product direction,
   implementation order, and linked GitHub issues.
+- [`PARTY_QUEUE_UX.md`](PARTY_QUEUE_UX.md) - the queue-first Play panel
+  workflow, lifecycle rules, and durable storage for the party queue system.
 - [`MATCH_RESULTS_AND_HISTORY.md`](MATCH_RESULTS_AND_HISTORY.md) - durable
   results, recent-match views, and recreational game-night statistics.
 - [`SCHEDULED_CUSTOM_NIGHTS.md`](SCHEDULED_CUSTOM_NIGHTS.md) - timezone-safe

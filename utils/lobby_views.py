@@ -586,6 +586,36 @@ class MatchContinuityView(discord.ui.View):
 # does for the public queue card and ready-check buttons above.
 
 
+class StartQueueModal(discord.ui.Modal):
+    """The entire default Start Queue flow: an optional name, then Start.
+
+    Mode/region/format/capacity/voice/skill get sensible defaults and are
+    only ever customized afterward via Queue Settings -> Edit Details — not
+    part of the default creation path, per the NeatQueue-simplicity product
+    guardrail from Issue #63.
+    """
+
+    def __init__(
+        self, on_submit: Callable[[discord.Interaction, str], Awaitable[None]]
+    ) -> None:
+        super().__init__(
+            title="Start Queue",
+            custom_id="godforge:lobby:start-queue-modal:v1",
+            timeout=900,
+        )
+        self._on_submit = on_submit
+        self.name_input = discord.ui.TextInput(
+            label="Queue name (optional)",
+            custom_id="queue_name",
+            required=False,
+            max_length=40,
+        )
+        self.add_item(self.name_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await self._on_submit(interaction, str(self.name_input.value))
+
+
 class RenameQueueModal(discord.ui.Modal):
     """The one place a queue name is typed — free text is only for names/notes."""
 

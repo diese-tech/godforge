@@ -30,9 +30,8 @@ def test_play_panel_is_persistent_with_stable_custom_id():
     ]
     assert [button.label for button in view.children] == [
         "Start Queue",
-        "Browse Queues",
         "Find a Queue",
-        "My Preferences",
+        "My Roles",
     ]
 
 

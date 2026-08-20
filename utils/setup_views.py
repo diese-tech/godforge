@@ -18,13 +18,14 @@ ROLE_CUSTOM_ID_PREFIX = "godforge:roles:preference"
 
 PLAY_ACTIONS = (
     ("create", "Start Queue", discord.ButtonStyle.success),
-    ("browse", "Browse Queues", discord.ButtonStyle.primary),
     # Issue #63: this used to silently join the first open lobby with space.
     # It's kept as action key "queue" so already-posted Play panels keep
     # routing correctly, but it now always makes the player choose an exact
     # queue (or one-click-shortcuts only when exactly one is open).
+    # "Browse Queues" was removed as a duplicate of this — the public queue
+    # card is the one canonical place to see a queue's roster.
     ("queue", "Find a Queue", discord.ButtonStyle.primary),
-    ("preferences", "My Preferences", discord.ButtonStyle.secondary),
+    ("preferences", "My Roles", discord.ButtonStyle.secondary),
 )
 
 ROLE_PREFERENCES = (

@@ -16,4 +16,4 @@ def test_setup_views_use_persistent_custom_ids():
 
     assert play.timeout is None
     assert roles.timeout is None
-    assert len({item.custom_id for item in play.children + roles.children}) == 13
+    assert len({item.custom_id for item in play.children + roles.children}) == 12

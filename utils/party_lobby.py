@@ -50,6 +50,19 @@ from utils.party_queue import QueueError, QueueStatus, ReadyStatus
 from utils.team_formation import FormationMode
 
 
+# Issue #63 UX-cleanup pass: Start Queue's default path no longer collects
+# mode/region/format/capacity/voice/skill up front — these sensible defaults
+# are used instead, and stay fully editable afterward via Queue Settings ->
+# Edit Details rather than being required every time a queue is started.
+DEFAULT_QUEUE_CAPACITY = 10
+DEFAULT_QUEUE_MODE = "conquest"
+DEFAULT_QUEUE_FORMAT = "5v5"
+
+# The public card shows a compact per-player role preview, not a full roster
+# dump — cap how many rows it lists before collapsing the rest into "+N".
+ROSTER_PREVIEW_LIMIT = 6
+
+
 @dataclass
 class PartyLobbyDeps:
     """Collaborators injected into `PartyLobbyService`.
@@ -96,6 +109,7 @@ class PartyLobbyDeps:
     change_roles_view: Callable[..., discord.ui.View] | None = None
     already_in_queue_view: Callable[..., discord.ui.View] | None = None
     rename_modal: Callable[..., discord.ui.Modal] | None = None
+    start_queue_modal: Callable[..., discord.ui.Modal] | None = None
 
 
 class PartyLobbyService:
@@ -109,6 +123,30 @@ class PartyLobbyService:
 
     # -- Rendering --------------------------------------------------------
 
+    @staticmethod
+    def _participant_role_summary(participant, guild: discord.Guild | None = None) -> str:
+        """One compact roster line: display name (or mention) · role context.
+
+        Issue #63 follow-up: the public card should give players enough
+        SMITE-specific context to decide whether to join, without becoming
+        an analytics panel — so this is a single short line per player, not
+        a breakdown of every saved preference.
+        """
+        member = guild.get_member(participant.user_id) if guild is not None else None
+        label = member.display_name if member is not None else f"<@{participant.user_id}>"
+        roles = [
+            role.title()
+            for role in (participant.primary_role, participant.secondary_role)
+            if role
+        ]
+        if roles:
+            role_text = " / ".join(roles)
+            if participant.fill:
+                role_text += " (Fill)"
+        else:
+            role_text = "Fill" if participant.fill else "No role set"
+        return f"{label} · {role_text}"
+
     def lobby_card_embed(
         self, lobby, guild: discord.Guild | None = None
     ) -> discord.Embed:
@@ -116,9 +154,6 @@ class PartyLobbyService:
         if guild is not None:
             member = guild.get_member(lobby.organizer_id)
             owner_name = member.display_name if member else None
-        participants = (
-            ", ".join(f"<@{p.user_id}>" for p in lobby.participants) or "None"
-        )
         embed = discord.Embed(
             title=lobby.display_title(owner_name),
             description=lobby.notes or "Reusable GodForge party queue",
@@ -130,9 +165,16 @@ class PartyLobbyService:
         embed.add_field(name="Queue", value=queue_line, inline=False)
         embed.add_field(name="Organizer", value=f"<@{lobby.organizer_id}>")
         embed.add_field(name="Format", value=lobby.format)
+        roster_lines = [
+            self._participant_role_summary(participant, guild)
+            for participant in lobby.participants[:ROSTER_PREVIEW_LIMIT]
+        ]
+        remaining = len(lobby.participants) - len(roster_lines)
+        if remaining > 0:
+            roster_lines.append(f"+{remaining} other{'s' if remaining != 1 else ''}")
         embed.add_field(
-            name="Roster",
-            value=f"{len(lobby.participants)}/{lobby.capacity} · {participants}",
+            name=f"Roster · {len(lobby.participants)}/{lobby.capacity}",
+            value="\n".join(roster_lines) or "No one has joined yet.",
             inline=False,
         )
         embed.add_field(
@@ -353,20 +395,25 @@ class PartyLobbyService:
         already works) means a retried "queue just filled" event, an
         organizer manually restarting a ready check, and restart recovery
         all edit the same message instead of posting duplicates.
+
+        Issue #63 follow-up: a ready check *starting* must not itself send a
+        notification ping — the only roster ping in the whole flow is the
+        one-time match-ready handoff (``_send_match_ready_handoff``). The
+        outstanding players are still shown as mentions, but inside the
+        embed's "Waiting on" field; embed mentions render as clickable
+        without notifying anyone, unlike a mention in the message content.
         """
         deps = self.deps
         delivery = lobby.delivery
-        content = " ".join(f"<@{member.user_id}>" for member in queue.active)
         if delivery.ready_channel_id and delivery.ready_message_id:
             channel = guild.get_channel(delivery.ready_channel_id)
             if channel is not None and hasattr(channel, "fetch_message"):
                 try:
                     message = await channel.fetch_message(delivery.ready_message_id)
                     await message.edit(
-                        content=content,
                         embed=self.ready_check_embed(lobby.lobby_id, queue),
                         view=deps.ready_check_view(),
-                        allowed_mentions=discord.AllowedMentions(users=True, roles=False),
+                        allowed_mentions=discord.AllowedMentions.none(),
                     )
                     return lobby
                 except (discord.NotFound, discord.Forbidden, discord.HTTPException,
@@ -380,10 +427,9 @@ class PartyLobbyService:
         if channel is None or not hasattr(channel, "send"):
             return lobby
         message = await channel.send(
-            content=content,
             embed=self.ready_check_embed(lobby.lobby_id, queue),
             view=deps.ready_check_view(),
-            allowed_mentions=discord.AllowedMentions(users=True, roles=False),
+            allowed_mentions=discord.AllowedMentions.none(),
         )
         channel_id = getattr(channel, "id", None)
         if channel_id is None:
@@ -481,31 +527,8 @@ class PartyLobbyService:
             for record in deps.party_repository.recover_active(guild_id)
             if record.lobby.state in {LobbyState.OPEN, LobbyState.FULL}
         ]
-        if action == "browse":
-            if not active:
-                await interaction.response.send_message(
-                    "No party queues are open yet.",
-                    ephemeral=True,
-                )
-                return
-            lobby = active[0]
-            await interaction.response.send_message(
-                embed=self.lobby_card_embed(lobby, interaction.guild),
-                view=deps.lobby_card_view(),
-                ephemeral=True,
-            )
-            for additional_lobby in active[1:]:
-                await interaction.followup.send(
-                    embed=self.lobby_card_embed(additional_lobby, interaction.guild),
-                    view=deps.lobby_card_view(),
-                    ephemeral=True,
-                )
-            return
         if action == "create":
-            view = deps.create_lobby_view(self.handle_create_lobby_submission)
-            await interaction.response.send_message(
-                embed=view.summary_embed(), view=view, ephemeral=True
-            )
+            await self.start_queue_flow(interaction)
             return
         if action == "queue":
             # Issue #63: this used to route to the first open lobby with
@@ -596,6 +619,79 @@ class PartyLobbyService:
         await interaction.response.send_message(
             f"{role_key.title()} {'added' if enabled else 'removed'}. "
             f"Preferences: {', '.join(saved.roles) or 'none'}.",
+            ephemeral=True,
+        )
+
+    async def start_queue_flow(self, interaction: discord.Interaction) -> None:
+        """The default Start Queue path: optional name, then Start.
+
+        Issue #63 UX-cleanup: queue configuration (mode/region/format/
+        capacity/voice/skill) no longer gates creation — it defaults
+        sensibly and is only ever tuned afterward via Queue Settings ->
+        Edit Details. The organizer still needs a usable SMITE role profile
+        (they're seated as the queue's first participant), so a first-time
+        organizer completes the same lightweight role picker a joining
+        player would; a returning organizer with saved roles skips straight
+        to Start.
+        """
+        deps = self.deps
+        guild_id = interaction.guild_id
+        if guild_id is None:
+            await interaction.response.send_message("Server-only action.", ephemeral=True)
+            return
+        existing_other = await self.find_active_queue_for_player(
+            guild_id, interaction.user.id
+        )
+        if existing_other is not None:
+            await self._reject_double_booking(interaction, existing_other)
+            return
+
+        async def name_submitted(modal_interaction: discord.Interaction, queue_name: str) -> None:
+            await self._start_queue_after_name(modal_interaction, queue_name)
+
+        await interaction.response.send_modal(deps.start_queue_modal(name_submitted))
+
+    async def _start_queue_after_name(
+        self, interaction: discord.Interaction, queue_name: str
+    ) -> None:
+        deps = self.deps
+        guild_id = interaction.guild_id
+        if guild_id is None:
+            await interaction.response.send_message("Server-only action.", ephemeral=True)
+            return
+        saved = deps.party_repository.get_player_preferences(guild_id, interaction.user.id)
+        default_payload = {
+            "mode": DEFAULT_QUEUE_MODE,
+            "region": "",
+            "format": DEFAULT_QUEUE_FORMAT,
+            "party_size": DEFAULT_QUEUE_CAPACITY,
+            "voice_required": False,
+            "skill_band": "",
+            "notes": "",
+            "queue_name": queue_name,
+        }
+        if saved.primary_role:
+            await self.handle_create_lobby_submission(interaction, default_payload)
+            return
+
+        # First-time organizer: the same lightweight Primary/Secondary/Fill
+        # picker a joining player sees, since they're about to become this
+        # queue's first participant.
+        async def role_handler(role_interaction: discord.Interaction, payload) -> None:
+            profile = PlayerPreferences(
+                str(payload["primary_role"]),
+                str(payload.get("secondary_role") or "") or None,
+                bool(payload["fill"]),
+                saved.captain,
+            )
+            deps.party_repository.set_player_preferences(
+                guild_id, role_interaction.user.id, profile
+            )
+            await self.handle_create_lobby_submission(role_interaction, default_payload)
+
+        await interaction.response.send_message(
+            "Choose your role preferences to start this queue.",
+            view=deps.join_preferences_view(role_handler),
             ephemeral=True,
         )
 

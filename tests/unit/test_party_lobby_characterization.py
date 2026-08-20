@@ -94,29 +94,16 @@ async def test_play_panel_preferences_shows_current_roles(party_repos):
     assert "view" in kwargs
 
 
-async def test_play_panel_browse_empty_reports_none(party_repos):
-    interaction = _interaction()
-    await bot._handle_play_panel_action(interaction, "browse")
-    reply = interaction.response.send_message.call_args.args[0]
-    assert "No party queues" in reply
-
-
-async def test_play_panel_create_opens_selection_wizard(party_repos):
+async def test_play_panel_create_opens_start_queue_modal(party_repos):
+    # Issue #63 UX-cleanup: Start Queue asks only for an optional name via a
+    # modal — mode/region/format/etc. default and move to post-creation
+    # Queue Settings -> Edit Details.
     interaction = _interaction()
     await bot._handle_play_panel_action(interaction, "create")
-    interaction.response.send_modal.assert_not_awaited()
-    kwargs = interaction.response.send_message.await_args.kwargs
-    assert kwargs["ephemeral"] is True
-    assert kwargs["view"].children[0].custom_id == "godforge:lobby:create:mode:v2"
-
-
-async def test_play_panel_browse_shows_open_lobby(party_repos):
-    party, *_ = party_repos
-    party.create(guild_id=1, organizer_id=100, capacity=10, operation_id="create-1")
-    interaction = _interaction()
-    await bot._handle_play_panel_action(interaction, "browse")
-    kwargs = interaction.response.send_message.call_args.kwargs
-    assert "embed" in kwargs
+    interaction.response.send_message.assert_not_awaited()
+    interaction.response.send_modal.assert_awaited_once()
+    modal = interaction.response.send_modal.await_args.args[0]
+    assert modal.custom_id == "godforge:lobby:start-queue-modal:v1"
 
 
 # -- Create lobby + join -------------------------------------------------

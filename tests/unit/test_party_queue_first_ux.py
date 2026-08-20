@@ -756,3 +756,120 @@ async def test_rename_extends_the_recruiting_expiry_clock(party_repos):
     await modal.on_submit(interaction)
 
     assert party.get(1, lobby.lobby_id).expires_at > soon
+
+
+# -- Owner-requested UX cleanup pass (post-review-2) -------------------------
+
+
+async def test_start_queue_returning_organizer_creates_immediately(party_repos, tmp_settings):
+    from utils.party import PlayerPreferences
+
+    party, *_ = party_repos
+    party.set_player_preferences(1, 100, PlayerPreferences("support", "solo", True, False))
+    interaction = _interaction(user_id=100)
+
+    await bot.party_lobby_service._start_queue_after_name(interaction, "Late Night Inhouses")
+
+    lobbies = party.recover_active(1)
+    assert len(lobbies) == 1
+    lobby = lobbies[0].lobby
+    assert lobby.display_name == "Late Night Inhouses"
+    assert lobby.capacity == 10
+    assert lobby.mode == "conquest"
+    organizer = lobby.participant(100)
+    assert organizer.primary_role == "support"
+    # No role wizard was shown — straight to the created-queue confirmation
+    # with the small recruiting-card action set.
+    kwargs = interaction.response.send_message.await_args.kwargs
+    action_ids = {item.action for item in kwargs["view"].children}
+    assert action_ids == {"join", "leave", "queue_settings", "cancel"}
+
+
+async def test_start_queue_first_time_organizer_requires_role_selection(
+    party_repos, tmp_settings
+):
+    party, *_ = party_repos
+    interaction = _interaction(user_id=101)
+
+    await bot.party_lobby_service._start_queue_after_name(interaction, "")
+
+    # No queue created yet — the organizer must pick roles first, same as a
+    # first-time joining player would.
+    assert party.recover_active(1) == []
+    view = interaction.response.send_message.await_args.kwargs["view"]
+    assert [item.custom_id for item in view.children] == [
+        "godforge:lobby:join:primary:v2",
+        "godforge:lobby:join:secondary:v2",
+        "godforge:lobby:join:fill:v2",
+        "godforge:lobby:join:confirm:v2",
+        "godforge:lobby:join:cancel:v2",
+    ]
+
+    # Completing that lightweight wizard actually creates the queue.
+    view.state = {"primary_role": "mid", "secondary_role": "", "fill": True}
+    confirm_button = next(
+        item for item in view.children if item.custom_id == "godforge:lobby:join:confirm:v2"
+    )
+    confirm_interaction = _interaction(user_id=101)
+    await confirm_button.callback(confirm_interaction)
+
+    lobbies = party.recover_active(1)
+    assert len(lobbies) == 1
+    organizer = lobbies[0].lobby.participant(101)
+    assert organizer.primary_role == "mid"
+    assert organizer.fill is True
+
+
+async def test_ready_check_start_does_not_send_a_notification_ping(party_repos):
+    party, *_ = party_repos
+    lobby = party.create(guild_id=1, organizer_id=1, capacity=2, operation_id="create-1")
+    party.save_participant(1, lobby.lobby_id, Participant(1), operation_id="j1")
+    party.save_participant(1, lobby.lobby_id, Participant(2), operation_id="j2")
+    interaction = _interaction(user_id=1, message=_lobby_footer_message(lobby.lobby_id))
+
+    await bot._handle_lobby_card_action(interaction, "ready_check")
+
+    send_kwargs = interaction.channel.send.await_args.kwargs
+    # Issue #63 follow-up: starting a ready check must not itself ping the
+    # roster — only the final match-ready handoff does.
+    assert not send_kwargs.get("content")
+    embed = send_kwargs["embed"]
+    assert any(field.name == "Waiting on" for field in embed.fields)
+
+
+async def test_public_card_shows_compact_role_context(party_repos):
+    party, *_ = party_repos
+    lobby = party.create(guild_id=1, organizer_id=1, capacity=10, operation_id="create-1")
+    party.save_participant(
+        1, lobby.lobby_id,
+        Participant(1, primary_role="support", secondary_role="solo", fill=True),
+        operation_id="j1",
+    )
+    lobby = party.save_participant(
+        1, lobby.lobby_id, Participant(2, fill=True), operation_id="j2",
+    )
+    guild = _guild(
+        1, members={1: MagicMock(display_name="Dustin"), 2: MagicMock(display_name="Debo")}
+    )
+
+    embed = bot.party_lobby_service.lobby_card_embed(lobby, guild)
+
+    roster_field = next(field for field in embed.fields if field.name.startswith("Roster"))
+    assert "Dustin · Support / Solo (Fill)" in roster_field.value
+    assert "Debo · Fill" in roster_field.value
+
+
+async def test_public_card_roster_truncates_with_others_count(party_repos):
+    party, *_ = party_repos
+    lobby = party.create(guild_id=1, organizer_id=1, capacity=10, operation_id="create-1")
+    for user_id in range(1, 9):
+        lobby = party.save_participant(
+            1, lobby.lobby_id, Participant(user_id, primary_role="mid"),
+            operation_id=f"j{user_id}",
+        )
+
+    embed = bot.party_lobby_service.lobby_card_embed(lobby)
+
+    roster_field = next(field for field in embed.fields if field.name.startswith("Roster"))
+    assert roster_field.value.count("\n") == 6
+    assert "+2 others" in roster_field.value

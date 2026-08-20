@@ -57,6 +57,7 @@ from utils.lobby_views import (
     ReadyCheckView,
     RecruitingCardView,
     RenameQueueModal,
+    StartQueueModal,
     TransferOrganizerView,
 )
 from utils.party_queue import (
@@ -1021,6 +1022,7 @@ _party_lobby_deps = PartyLobbyDeps(
     change_roles_view=lambda handler: ChangeRolesPromptView(handler),
     already_in_queue_view=lambda handler: AlreadyInQueueView(handler),
     rename_modal=lambda handler, current_name: RenameQueueModal(handler, current_name),
+    start_queue_modal=lambda handler: StartQueueModal(handler),
 )
 party_lobby_service = PartyLobbyService(_party_lobby_deps)
 feature_registry.register(PartyLobbyFeature(party_lobby_service))

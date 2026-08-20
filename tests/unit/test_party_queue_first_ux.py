@@ -873,3 +873,28 @@ async def test_public_card_roster_truncates_with_others_count(party_repos):
     roster_field = next(field for field in embed.fields if field.name.startswith("Roster"))
     assert roster_field.value.count("\n") == 6
     assert "+2 others" in roster_field.value
+
+
+async def test_first_time_join_succeeds_without_touching_secondary_role(party_repos):
+    # Issue #63 micro-fix: Secondary role is optional and defaults to None,
+    # so Join must succeed end-to-end with only Primary + Fill answered.
+    party, *_ = party_repos
+    lobby = party.create(guild_id=1, organizer_id=1, capacity=10, operation_id="create-1")
+    interaction = _interaction(user_id=2, message=_lobby_footer_message(lobby.lobby_id))
+
+    await bot._handle_lobby_card_action(interaction, "join")
+
+    view = interaction.response.send_message.await_args.kwargs["view"]
+    view.state["primary_role"] = "adc"
+    view.state["fill"] = True  # Secondary role deliberately left untouched.
+    confirm_button = next(
+        item for item in view.children if item.custom_id == "godforge:lobby:join:confirm:v2"
+    )
+    confirm_interaction = _interaction(user_id=2, message=_lobby_footer_message(lobby.lobby_id))
+
+    await confirm_button.callback(confirm_interaction)
+
+    participant = party.get(1, lobby.lobby_id).participant(2)
+    assert participant.primary_role == "adc"
+    assert participant.secondary_role is None
+    assert participant.fill is True

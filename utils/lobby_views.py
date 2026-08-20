@@ -382,6 +382,10 @@ class JoinPreferencesView(discord.ui.View):
         super().__init__(timeout=900)
         self._handler = handler
         self.state = dict(initial or {})
+        # Secondary role is the one genuinely optional field — default it to
+        # None so Join/Create succeeds without the player having to touch
+        # this select at all, not just without picking a specific role.
+        self.state.setdefault("secondary_role", None)
         definitions = (
             ("primary_role", "primary", "Primary role", _ROLE_OPTIONS),
             ("secondary_role", "secondary", "Secondary role", (("None", "none"), *_ROLE_OPTIONS)),
@@ -431,9 +435,11 @@ class JoinPreferencesView(discord.ui.View):
                 content="Queue join cancelled.", view=None
             )
             return
-        missing = [key for key in ("primary_role", "secondary_role", "fill") if key not in self.state]
+        # Secondary role is optional and always defaulted (see __init__) —
+        # only Primary role and Fill are actually required selections.
+        missing = [key for key in ("primary_role", "fill") if key not in self.state]
         if missing:
-            raise _ValidationError("Complete every role and availability selection first.")
+            raise _ValidationError("Choose a Primary role and Fill preference first.")
         if self.state["primary_role"] == self.state["secondary_role"]:
             raise _ValidationError("Primary and secondary roles must be different.")
         await self._handler(interaction, dict(self.state))

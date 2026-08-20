@@ -14,6 +14,7 @@ from utils.lobby_views import (
     MatchFormationView,
     MatchResultView,
     ReadyCheckView,
+    _ValidationError,
 )
 
 
@@ -131,6 +132,54 @@ async def test_join_wizard_rejects_duplicate_roles_and_cancel_is_safe():
     cancel_interaction.response.edit_message.assert_awaited_once_with(
         content="Queue join cancelled.", view=None
     )
+
+
+async def test_join_wizard_secondary_role_defaults_to_none_without_selection():
+    # Issue #63 follow-up: Secondary role is described as optional, so Join
+    # must succeed without the player ever touching that select — not just
+    # without picking a specific role from it.
+    view = JoinPreferencesView(AsyncMock())
+
+    assert view.state["secondary_role"] is None
+    secondary_select = next(
+        item for item in view.children
+        if getattr(item, "custom_id", "") == "godforge:lobby:join:secondary:v2"
+    )
+    assert next(o for o in secondary_select.options if o.default).value == "none"
+
+
+async def test_join_wizard_requires_only_primary_role_and_fill():
+    handler = AsyncMock()
+    view = JoinPreferencesView(handler)
+    interaction = _interaction()
+
+    # Primary role missing entirely -> rejected.
+    with pytest.raises(_ValidationError):
+        await view.act(interaction, "confirm")
+    handler.assert_not_awaited()
+
+    # Primary role set, Fill still missing -> rejected.
+    view.state["primary_role"] = "mid"
+    with pytest.raises(_ValidationError):
+        await view.act(interaction, "confirm")
+    handler.assert_not_awaited()
+
+    # Primary + Fill set, Secondary never touched -> succeeds using the
+    # default None.
+    view.state["fill"] = False
+    await view.act(interaction, "confirm")
+    handler.assert_awaited_once_with(
+        interaction, {"primary_role": "mid", "secondary_role": None, "fill": False}
+    )
+
+
+async def test_join_wizard_secondary_role_still_selectable():
+    view = JoinPreferencesView(AsyncMock())
+    interaction = _interaction()
+
+    await view.select(interaction, "secondary_role", "support")
+
+    assert view.state["secondary_role"] == "support"
 
 
 def test_lobby_card_is_persistent_with_stable_action_ids():

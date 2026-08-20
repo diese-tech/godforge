@@ -26,6 +26,19 @@ LOBBY_CARD_ACTIONS = (
     ("teams_captains", "Captain Teams", discord.ButtonStyle.primary),
 )
 
+# Issue #63: the *public* recruiting card intentionally exposes only these
+# four actions (content-budget rule from the issue). Everything an organizer
+# might need beyond Join/Leave/Cancel lives behind the ephemeral "Queue
+# Settings" panel instead of crowding the public card. This reuses the same
+# custom_id prefix/action names as LOBBY_CARD_ACTIONS above for the actions
+# they share, so a single shared handler keeps routing both card styles.
+RECRUITING_CARD_ACTIONS = (
+    ("join", "Join Queue", discord.ButtonStyle.success),
+    ("leave", "Leave Queue", discord.ButtonStyle.secondary),
+    ("queue_settings", "Queue Settings", discord.ButtonStyle.secondary),
+    ("cancel", "Cancel Queue", discord.ButtonStyle.danger),
+)
+
 READY_CHECK_ACTIONS = (
     ("ready", "Ready", discord.ButtonStyle.success),
     ("need_five", "Need 5 Minutes", discord.ButtonStyle.secondary),
@@ -59,6 +72,7 @@ MATCH_FORMATION_ACTIONS = (
 
 ModalHandler = Callable[[discord.Interaction, dict[str, object]], Awaitable[None]]
 LobbyActionHandler = Callable[[discord.Interaction, str], Awaitable[None]]
+InteractionHandler = Callable[[discord.Interaction], Awaitable[None]]
 
 _LOGGER = logging.getLogger(__name__)
 _SAFE_ERROR = "GodForge could not complete that action. Please try again."
@@ -122,6 +136,24 @@ class _StateSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         await self.owner.select(interaction, self.key, self.values[0])
+
+
+class _SimpleActionButton(discord.ui.Button):
+    """A one-shot ephemeral button whose handler takes only the interaction."""
+
+    def __init__(
+        self, label: str, style: discord.ButtonStyle, custom_id: str,
+        handler: InteractionHandler,
+    ) -> None:
+        super().__init__(label=label, style=style, custom_id=custom_id)
+        self._handler = handler
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        try:
+            await self._handler(interaction)
+        except Exception:
+            _LOGGER.exception("GodForge ephemeral action failed")
+            await _send_safe_error(interaction)
 
 
 class _WizardButton(discord.ui.Button):
@@ -326,7 +358,13 @@ class CreateLobbyWizardView(discord.ui.View):
 
 
 class JoinPreferencesView(discord.ui.View):
-    """Constrained role, fill, and captain selections for joining a lobby."""
+    """Constrained role/fill selections for joining a queue.
+
+    Issue #63: this is the *only* thing a first-time joiner has to fill in —
+    Primary role, optional Secondary role, and Fill. Captain willingness is
+    no longer collected here; it stays editable from "My Preferences" and is
+    only asked for later if an organizer picks Captain Teams formation.
+    """
 
     def __init__(self, handler: ModalHandler, initial: dict[str, object] | None = None) -> None:
         super().__init__(timeout=900)
@@ -336,22 +374,26 @@ class JoinPreferencesView(discord.ui.View):
             ("primary_role", "primary", "Primary role", _ROLE_OPTIONS),
             ("secondary_role", "secondary", "Secondary role", (("None", "none"), *_ROLE_OPTIONS)),
             ("fill", "fill", "Willing to fill?", (("Yes", "yes"), ("No", "no"))),
-            ("captain", "captain", "Willing to captain?", (("Yes", "yes"), ("No", "no"))),
         )
         for row, (key, custom_key, label, values) in enumerate(definitions):
+            selected = self.state.get(key)
+            if key == "secondary_role":
+                selected = "none" if key in self.state and selected is None else selected
+            if key == "fill" and key in self.state:
+                selected = "yes" if selected else "no"
             self.add_item(
                 _StateSelect(
                     self,
                     key,
                     custom_id=f"godforge:lobby:join:{custom_key}:v2",
                     placeholder=label,
-                    options=_options(values),
+                    options=_options(values, selected),
                     row=row,
                 )
             )
         self.add_item(
             _WizardButton(
-                self, "confirm", "Join Lobby", discord.ButtonStyle.success,
+                self, "confirm", "Join Queue", discord.ButtonStyle.success,
                 custom_id="godforge:lobby:join:confirm:v2", row=4,
             )
         )
@@ -365,7 +407,7 @@ class JoinPreferencesView(discord.ui.View):
     async def select(self, interaction: discord.Interaction, key: str, value: str) -> None:
         if key == "secondary_role":
             self.state[key] = None if value == "none" else value
-        elif key in {"fill", "captain"}:
+        elif key == "fill":
             self.state[key] = value == "yes"
         else:
             self.state[key] = value
@@ -374,10 +416,10 @@ class JoinPreferencesView(discord.ui.View):
     async def act(self, interaction: discord.Interaction, action: str) -> None:
         if action == "cancel":
             await interaction.response.edit_message(
-                content="Lobby join cancelled.", view=None
+                content="Queue join cancelled.", view=None
             )
             return
-        missing = [key for key in ("primary_role", "secondary_role", "fill", "captain") if key not in self.state]
+        missing = [key for key in ("primary_role", "secondary_role", "fill") if key not in self.state]
         if missing:
             raise _ValidationError("Complete every role and availability selection first.")
         if self.state["primary_role"] == self.state["secondary_role"]:
@@ -428,6 +470,21 @@ class LobbyCardView(discord.ui.View):
                     row=0 if index < 5 else 1,
                 )
             )
+
+
+class RecruitingCardView(discord.ui.View):
+    """The public queue card's button row while it is recruiting (Issue #63).
+
+    Deliberately small: Join/Leave/Settings/Cancel only. It reuses the same
+    action names and custom_id prefix as ``LobbyCardView`` for the buttons
+    they share, so the one shared handler (and the one persistent-view
+    registration covering those custom_ids) keeps routing both.
+    """
+
+    def __init__(self, handler: LobbyActionHandler) -> None:
+        super().__init__(timeout=None)
+        for action, label, style in RECRUITING_CARD_ACTIONS:
+            self.add_item(_LobbyActionButton(action, label, style, handler, row=0))
 
 
 class ReadyCheckView(discord.ui.View):
@@ -507,3 +564,179 @@ class MatchContinuityView(discord.ui.View):
                     row=0,
                 )
             )
+
+
+# -- Issue #63: queue-first UX views ----------------------------------------
+#
+# Everything below is ephemeral (per-interaction, not persistent-registered)
+# because it's either a rare organizer recovery action or a one-time player
+# choice — Discord doesn't need to route to it after a restart the way it
+# does for the public queue card and ready-check buttons above.
+
+
+class RenameQueueModal(discord.ui.Modal):
+    """The one place a queue name is typed — free text is only for names/notes."""
+
+    def __init__(
+        self,
+        on_submit: Callable[[discord.Interaction, str], Awaitable[None]],
+        current_name: str = "",
+    ) -> None:
+        super().__init__(
+            title="Rename Queue",
+            custom_id="godforge:lobby:rename-modal:v1",
+            timeout=900,
+        )
+        self._on_submit = on_submit
+        self.name_input = discord.ui.TextInput(
+            label="Queue name (optional)",
+            custom_id="queue_name",
+            required=False,
+            max_length=40,
+            default=current_name,
+        )
+        self.add_item(self.name_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await self._on_submit(interaction, str(self.name_input.value))
+
+
+class QueueSettingsView(discord.ui.View):
+    """Ephemeral organizer-only menu.
+
+    Issue #63 keeps the public card down to Join/Leave/Settings/Cancel; every
+    less-common organizer action (rename, full edit, recovery repost,
+    ownership transfer, a manual ready-check nudge) lives behind this panel
+    instead.
+    """
+
+    _ACTIONS = (
+        ("rename", "Rename", discord.ButtonStyle.secondary),
+        ("edit", "Edit Details", discord.ButtonStyle.secondary),
+        ("repost", "Repost Queue", discord.ButtonStyle.secondary),
+        ("transfer_organizer", "Transfer Organizer", discord.ButtonStyle.secondary),
+        ("ready_check", "Start Ready Check", discord.ButtonStyle.primary),
+    )
+    CUSTOM_ID_PREFIX = "godforge:lobby:settings"
+
+    def __init__(self, handler: LobbyActionHandler) -> None:
+        super().__init__(timeout=300)
+        for index, (action, label, style) in enumerate(self._ACTIONS):
+            self.add_item(
+                _LobbyActionButton(
+                    action,
+                    label,
+                    style,
+                    handler,
+                    custom_id_prefix=self.CUSTOM_ID_PREFIX,
+                    row=0 if index < 4 else 1,
+                )
+            )
+
+
+class TransferOrganizerView(discord.ui.View):
+    """Ephemeral organizer-only picker limited to the queue's own roster.
+
+    A plain Select over the current participants (never a free-form ID or
+    an unrestricted user picker) so the organizer can only ever hand off to
+    someone who is actually in this queue, matching what
+    ``party_store.transfer_organizer`` already enforces.
+    """
+
+    def __init__(
+        self,
+        handler: Callable[[discord.Interaction, int], Awaitable[None]],
+        participants: list[tuple[int, str]],
+    ) -> None:
+        super().__init__(timeout=300)
+        select = discord.ui.Select(
+            custom_id="godforge:lobby:settings:transfer-select:v1",
+            placeholder="New organizer",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(label=label[:100], value=str(user_id))
+                for user_id, label in participants[:25]
+            ],
+        )
+
+        async def callback(select_interaction: discord.Interaction) -> None:
+            try:
+                await handler(select_interaction, int(select.values[0]))
+            except Exception:
+                _LOGGER.exception("Organizer transfer selection failed")
+                await _send_safe_error(select_interaction)
+
+        select.callback = callback
+        self.add_item(select)
+
+
+class QueueSelectView(discord.ui.View):
+    """Ephemeral explicit-choice picker for the global "Find a Queue" flow.
+
+    Issue #63: once more than one queue is open in a guild, the global entry
+    point must never guess which one a player means — this view forces an
+    explicit pick instead of silently routing to the first open lobby.
+    """
+
+    def __init__(
+        self,
+        handler: Callable[[discord.Interaction, str], Awaitable[None]],
+        queues: list[tuple[str, str]],
+    ) -> None:
+        super().__init__(timeout=300)
+        select = discord.ui.Select(
+            custom_id="godforge:lobby:find-queue-select:v1",
+            placeholder="Choose a queue to join",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(label=label[:100], value=lobby_id)
+                for lobby_id, label in queues[:25]
+            ],
+        )
+
+        async def callback(select_interaction: discord.Interaction) -> None:
+            try:
+                await handler(select_interaction, select.values[0])
+            except Exception:
+                _LOGGER.exception("Queue selection failed")
+                await _send_safe_error(select_interaction)
+
+        select.callback = callback
+        self.add_item(select)
+
+
+class ChangeRolesPromptView(discord.ui.View):
+    """A single lightweight recovery action attached to a fast-path join ack.
+
+    Issue #63: a returning player with saved preferences joins in one click
+    with no wizard; this is the low-friction escape hatch if those saved
+    roles are now wrong.
+    """
+
+    def __init__(self, handler: InteractionHandler) -> None:
+        super().__init__(timeout=300)
+        self.add_item(
+            _SimpleActionButton(
+                "Change Roles",
+                discord.ButtonStyle.secondary,
+                "godforge:lobby:change-roles:v1",
+                handler,
+            )
+        )
+
+
+class AlreadyInQueueView(discord.ui.View):
+    """Recovery action shown when a player tries to double-book a second queue."""
+
+    def __init__(self, handler: InteractionHandler) -> None:
+        super().__init__(timeout=300)
+        self.add_item(
+            _SimpleActionButton(
+                "Leave That Queue",
+                discord.ButtonStyle.secondary,
+                "godforge:lobby:leave-other-queue:v1",
+                handler,
+            )
+        )

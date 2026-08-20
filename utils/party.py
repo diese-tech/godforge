@@ -6,6 +6,8 @@ identity and survives message, channel, and room recreation.
 
 from __future__ import annotations
 
+import hashlib
+import re
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -103,6 +105,14 @@ class DiscordDelivery:
     team_channel_ids: tuple[int, ...] = ()
     match_channel_id: int | None = None
     formation_message_id: int | None = None
+    # Issue #63: the durable ready-check card location, so a restart or a
+    # retried "start ready check" click edits the existing message instead
+    # of posting a duplicate one.
+    ready_channel_id: int | None = None
+    ready_message_id: int | None = None
+    # Set once the one-time match-ready roster ping has been sent, so a
+    # retried/duplicated "everyone is ready" event can never send it twice.
+    match_ready_notified: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,6 +157,41 @@ class PlayerPreferences:
 def _normalize_optional(value: str | None) -> str | None:
     normalized = str(value or "").strip().lower()
     return normalized or None
+
+
+# Issue #63: queue display names are metadata a player typed, so they must be
+# stripped of anything that could ping people or break Discord formatting
+# before they are ever stored or rendered on a public card.
+_MENTION_PATTERN = re.compile(r"<@[!&]?\d+>|<#\d+>|@everyone|@here")
+_MAX_DISPLAY_NAME_LENGTH = 40
+
+
+def sanitize_queue_name(value: str | None) -> str:
+    """Strip mentions/markdown risk and cap length for an organizer-chosen name."""
+    text = _MENTION_PATTERN.sub("", str(value or "")).strip()
+    text = re.sub(r"\s+", " ", text)
+    text = text.replace("`", "'")
+    return text[:_MAX_DISPLAY_NAME_LENGTH].strip()
+
+
+_QUEUE_CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"  # no 0/O/1/I ambiguity
+
+
+def generate_queue_code(lobby_id: str, salt: int = 0) -> str:
+    """Deterministically derive a short human-readable queue code.
+
+    Deterministic in ``lobby_id`` (and an optional collision-avoidance
+    ``salt``) so retried/idempotent creation never needs a second source of
+    truth for "what code did we already hand out for this queue".
+    """
+    digest = hashlib.sha256(f"{lobby_id}:{salt}".encode()).digest()
+    value = int.from_bytes(digest[:8], "big")
+    alphabet = _QUEUE_CODE_ALPHABET
+    chars = []
+    for _ in range(4):
+        value, index = divmod(value, len(alphabet))
+        chars.append(alphabet[index])
+    return "".join(chars)
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,6 +242,12 @@ class PartyLobby:
     voice_required: bool = False
     skill_band: str = ""
     notes: str = ""
+    # Issue #63: stable, human-readable queue identity. ``queue_code`` is
+    # generated once at creation and never changes; ``display_name`` is
+    # optional cosmetic metadata an organizer can rename freely. Neither is
+    # ever used as a lookup key — ``lobby_id`` remains the only identity.
+    queue_code: str = ""
+    display_name: str = ""
 
     def __post_init__(self) -> None:
         if not self.lobby_id.strip():
@@ -216,6 +267,20 @@ class PartyLobby:
         object.__setattr__(self, "format", _normalize_optional(self.format) or "5v5")
         object.__setattr__(self, "skill_band", _normalize_optional(self.skill_band) or "")
         object.__setattr__(self, "notes", self.notes.strip())
+        object.__setattr__(
+            self,
+            "queue_code",
+            self.queue_code.strip().upper() or generate_queue_code(self.lobby_id),
+        )
+        object.__setattr__(self, "display_name", sanitize_queue_name(self.display_name))
+
+    def display_title(self, fallback_owner_name: str | None = None) -> str:
+        """The queue's public title: its display name, or a friendly fallback."""
+        if self.display_name:
+            return self.display_name
+        if fallback_owner_name:
+            return f"{fallback_owner_name}'s Queue"
+        return f"Queue {self.queue_code}"
 
     @property
     def is_terminal(self) -> bool:

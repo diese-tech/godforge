@@ -29,9 +29,9 @@ def test_play_panel_is_persistent_with_stable_custom_id():
         for action_key, _label, _style in PLAY_ACTIONS
     ]
     assert [button.label for button in view.children] == [
-        "Create Lobby",
-        "Browse Lobbies",
-        "Join Queue",
+        "Start Queue",
+        "Browse Queues",
+        "Find a Queue",
         "My Preferences",
     ]
 

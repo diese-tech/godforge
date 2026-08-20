@@ -44,13 +44,14 @@ def test_create_wizard_uses_only_constrained_controls_for_configuration():
 
 
 def test_join_wizard_exposes_role_and_boolean_selections_without_text_inputs():
+    # Issue #63: captain willingness is no longer collected during a normal
+    # queue join — only Primary role, Secondary role, and Fill.
     view = JoinPreferencesView(AsyncMock())
 
     assert [item.custom_id for item in view.children] == [
         "godforge:lobby:join:primary:v2",
         "godforge:lobby:join:secondary:v2",
         "godforge:lobby:join:fill:v2",
-        "godforge:lobby:join:captain:v2",
         "godforge:lobby:join:confirm:v2",
         "godforge:lobby:join:cancel:v2",
     ]
@@ -113,21 +114,20 @@ async def test_join_wizard_rejects_duplicate_roles_and_cancel_is_safe():
             "primary_role": "mid",
             "secondary_role": "mid",
             "fill": False,
-            "captain": False,
         },
     )
     interaction = _interaction()
 
-    await view.children[4].callback(interaction)
+    await view.children[3].callback(interaction)
 
     handler.assert_not_awaited()
     assert "must be different" in interaction.response.send_message.await_args.args[0]
 
     cancelled = JoinPreferencesView(handler)
     cancel_interaction = _interaction()
-    await cancelled.children[5].callback(cancel_interaction)
+    await cancelled.children[4].callback(cancel_interaction)
     cancel_interaction.response.edit_message.assert_awaited_once_with(
-        content="Lobby join cancelled.", view=None
+        content="Queue join cancelled.", view=None
     )
 
 

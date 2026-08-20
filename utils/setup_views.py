@@ -17,9 +17,13 @@ PLAY_CUSTOM_ID_PREFIX = "godforge:party:panel"
 ROLE_CUSTOM_ID_PREFIX = "godforge:roles:preference"
 
 PLAY_ACTIONS = (
-    ("create", "Create Lobby", discord.ButtonStyle.success),
-    ("browse", "Browse Lobbies", discord.ButtonStyle.primary),
-    ("queue", "Join Queue", discord.ButtonStyle.primary),
+    ("create", "Start Queue", discord.ButtonStyle.success),
+    ("browse", "Browse Queues", discord.ButtonStyle.primary),
+    # Issue #63: this used to silently join the first open lobby with space.
+    # It's kept as action key "queue" so already-posted Play panels keep
+    # routing correctly, but it now always makes the player choose an exact
+    # queue (or one-click-shortcuts only when exactly one is open).
+    ("queue", "Find a Queue", discord.ButtonStyle.primary),
     ("preferences", "My Preferences", discord.ButtonStyle.secondary),
 )
 

@@ -44,13 +44,20 @@ from utils.guild_setup import (
 from utils.managed_roles import ManagedRoleError, reconcile as reconcile_roles, set_member_role
 from utils.setup_views import PlayPanelView, RolePreferencesView
 from utils.lobby_views import (
+    AlreadyInQueueView,
+    ChangeRolesPromptView,
     CreateLobbyWizardView,
     JoinPreferencesView,
     LobbyCardView,
     MatchFormationView,
     MatchContinuityView,
     MatchResultView,
+    QueueSelectView,
+    QueueSettingsView,
     ReadyCheckView,
+    RecruitingCardView,
+    RenameQueueModal,
+    TransferOrganizerView,
 )
 from utils.party_queue import (
     PartyQueueService,
@@ -183,6 +190,12 @@ class GodForgeClient(discord.Client):
         self.add_view(PlayPanelView(_handle_play_panel_action))
         self.add_view(RolePreferencesView(_handle_role_preference))
         self.add_view(LobbyCardView(_handle_lobby_card_action))
+        # Issue #63: the public queue card while recruiting uses a smaller
+        # button set (Join/Leave/Settings/Cancel) than LobbyCardView above,
+        # but shares the same custom_id prefix/action names for the buttons
+        # both expose — this registers the one new custom_id it adds
+        # (queue_settings) so it keeps routing correctly after a restart.
+        self.add_view(RecruitingCardView(_handle_lobby_card_action))
         self.add_view(ReadyCheckView(_handle_ready_check_action))
         self.add_view(MatchFormationView(_handle_lobby_card_action))
         self.add_view(MatchResultView(_handle_match_result_action))
@@ -994,6 +1007,20 @@ _party_lobby_deps = PartyLobbyDeps(
     join_preferences_view=JoinPreferencesView,
     match_result_view=lambda: MatchResultView(_handle_match_result_action),
     match_formation_view=lambda: MatchFormationView(_handle_lobby_card_action),
+    # Issue #63 additions — small ephemeral/organizer-only views. Each
+    # factory mirrors the create_lobby_view/join_preferences_view convention
+    # above: the caller supplies its own per-interaction handler closure, so
+    # these views stay generic and don't need their own bot.py-level
+    # persistent handler.
+    recruiting_card_view=lambda: RecruitingCardView(_handle_lobby_card_action),
+    queue_settings_view=lambda: QueueSettingsView(_handle_lobby_card_action),
+    transfer_organizer_view=lambda handler, participants: TransferOrganizerView(
+        handler, participants
+    ),
+    queue_select_view=lambda handler, queues: QueueSelectView(handler, queues),
+    change_roles_view=lambda handler: ChangeRolesPromptView(handler),
+    already_in_queue_view=lambda handler: AlreadyInQueueView(handler),
+    rename_modal=lambda handler, current_name: RenameQueueModal(handler, current_name),
 )
 party_lobby_service = PartyLobbyService(_party_lobby_deps)
 feature_registry.register(PartyLobbyFeature(party_lobby_service))

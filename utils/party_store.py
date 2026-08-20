@@ -7,7 +7,7 @@ import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterator
 
@@ -21,6 +21,8 @@ from utils.party import (
     PlayerPreferences,
     RecoveryRecord,
     ensure_utc,
+    generate_queue_code,
+    sanitize_queue_name,
     utc_now,
     validate_transition,
 )
@@ -135,6 +137,10 @@ class SQLitePartyRepository:
                 "voice_required": "INTEGER NOT NULL DEFAULT 0",
                 "skill_band": "TEXT NOT NULL DEFAULT ''",
                 "notes": "TEXT NOT NULL DEFAULT ''",
+                # Issue #63: stable queue code + optional display name. Existing
+                # rows backfill queue_code lazily on first read (see ``_get``).
+                "queue_code": "TEXT NOT NULL DEFAULT ''",
+                "display_name": "TEXT NOT NULL DEFAULT ''",
             },
         )
         preference_columns = {
@@ -173,6 +179,7 @@ class SQLitePartyRepository:
         voice_required: bool = False,
         skill_band: str = "",
         notes: str = "",
+        display_name: str = "",
     ) -> PartyLobby:
         # A Discord interaction retry must resolve to the same domain identity
         # even if its caller did not pre-allocate a lobby ID.
@@ -188,6 +195,7 @@ class SQLitePartyRepository:
                     raise LobbyNotFoundError(prior["lobby_id"])
                 return lobby
             now = utc_now()
+            queue_code = self._unique_queue_code(conn, guild_id, lobby_id)
             lobby = PartyLobby(
                 lobby_id=lobby_id,
                 guild_id=guild_id,
@@ -203,23 +211,45 @@ class SQLitePartyRepository:
                 voice_required=voice_required,
                 skill_band=skill_band,
                 notes=notes,
+                queue_code=queue_code,
+                display_name=display_name,
             )
             conn.execute(
                 """INSERT INTO party_lobbies
                    (lobby_id,guild_id,organizer_id,capacity,state,created_at,
                     updated_at,expires_at,version,delivery_json,mode,region,format,
-                    voice_required,skill_band,notes)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    voice_required,skill_band,notes,queue_code,display_name)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     lobby.lobby_id, guild_id, organizer_id, capacity, lobby.state,
                     _encode_time(now), _encode_time(now), _encode_time(expires_at),
                     lobby.version, self._delivery_json(lobby.delivery),
                     lobby.mode, lobby.region, lobby.format,
                     int(lobby.voice_required), lobby.skill_band, lobby.notes,
+                    lobby.queue_code, lobby.display_name,
                 ),
             )
             self._audit(conn, lobby, operation_id, fingerprint, "created", None, None)
             return lobby
+
+    @staticmethod
+    def _unique_queue_code(conn: sqlite3.Connection, guild_id: int, lobby_id: str) -> str:
+        """Pick a queue code that isn't already live in this guild.
+
+        Deterministic in ``lobby_id`` so a retried create() (deduped above by
+        operation_id) never needs to reach here twice; the salted fallback
+        only matters for the rare case where two different queues collide.
+        """
+        for salt in range(50):
+            candidate = generate_queue_code(lobby_id, salt)
+            row = conn.execute(
+                "SELECT 1 FROM party_lobbies WHERE guild_id=? AND queue_code=? "
+                f"AND state IN ({','.join('?' for _ in ACTIVE_STATES)})",
+                (guild_id, candidate, *(state.value for state in ACTIVE_STATES)),
+            ).fetchone()
+            if row is None:
+                return candidate
+        raise RuntimeError("could not allocate a unique queue code")
 
     def get(self, guild_id: int, lobby_id: str) -> PartyLobby | None:
         with self._connect() as conn:
@@ -316,6 +346,89 @@ class SQLitePartyRepository:
                 {"new_organizer_id": new_organizer_id},
             )
             return changed
+
+    def rename(
+        self,
+        guild_id: int,
+        lobby_id: str,
+        display_name: str,
+        *,
+        operation_id: str,
+        actor_id: int,
+    ) -> PartyLobby:
+        """Change the organizer-facing queue name. Never touches lobby_id/queue_code."""
+        sanitized = sanitize_queue_name(display_name)
+        fingerprint = f"rename:{guild_id}:{lobby_id}:{sanitized}"
+        with self._transaction() as conn:
+            if self._operation(conn, operation_id, fingerprint):
+                return self._require(conn, guild_id, lobby_id)
+            lobby = self._require(conn, guild_id, lobby_id)
+            if lobby.organizer_id != actor_id:
+                raise PermissionError("only the organizer can rename this queue")
+            if lobby.state not in {LobbyState.OPEN, LobbyState.FULL}:
+                raise ValueError("a queue can only be renamed while it is recruiting")
+            conn.execute(
+                "UPDATE party_lobbies SET display_name=?,updated_at=?,version=version+1 "
+                "WHERE lobby_id=? AND guild_id=?",
+                (sanitized, _encode_time(utc_now()), lobby_id, guild_id),
+            )
+            changed = self._require(conn, guild_id, lobby_id)
+            self._audit(
+                conn, changed, operation_id, fingerprint, "renamed",
+                lobby.state, actor_id, {"display_name": sanitized},
+            )
+            return changed
+
+    def touch_recruiting_activity(
+        self,
+        guild_id: int,
+        lobby_id: str,
+        *,
+        operation_id: str,
+        minutes: int = 60,
+    ) -> PartyLobby:
+        """Push back a recruiting queue's inactivity-expiry clock.
+
+        Called after every "meaningful" recruiting action (join/leave/rename/
+        promotion) per Issue #63 so a queue only expires after real silence,
+        not a fixed timer from creation. A no-op outside OPEN/FULL, since
+        ready-check has its own deadline and later states don't expire this
+        way.
+        """
+        fingerprint = f"touch:{guild_id}:{lobby_id}"
+        with self._transaction() as conn:
+            lobby = self._require(conn, guild_id, lobby_id)
+            if lobby.state not in {LobbyState.OPEN, LobbyState.FULL}:
+                return lobby
+            if self._operation(conn, operation_id, fingerprint):
+                return self._require(conn, guild_id, lobby_id)
+            new_expiry = utc_now() + timedelta(minutes=minutes)
+            conn.execute(
+                "UPDATE party_lobbies SET expires_at=? WHERE lobby_id=? AND guild_id=?",
+                (_encode_time(new_expiry), lobby_id, guild_id),
+            )
+            changed = self._require(conn, guild_id, lobby_id)
+            self._audit(
+                conn, changed, operation_id, fingerprint, "recruiting_activity_touch",
+                lobby.state, None,
+            )
+            return changed
+
+    def find_active_lobby_for_player(
+        self, guild_id: int, user_id: int, *, exclude_lobby_id: str | None = None
+    ) -> PartyLobby | None:
+        """The player's other active queue in this guild, if any.
+
+        Issue #63: a player may only belong to one active recruiting/ready/
+        forming/active queue per guild at a time.
+        """
+        for record in self.recover_active(guild_id):
+            lobby = record.lobby
+            if lobby.lobby_id == exclude_lobby_id:
+                continue
+            if lobby.participant(user_id) is not None:
+                return lobby
+        return None
 
     def transition(
         self,
@@ -710,6 +823,9 @@ class SQLitePartyRepository:
                 team_channel_ids=tuple(delivery.get("team_channel_ids", ())),
                 match_channel_id=delivery.get("match_channel_id"),
                 formation_message_id=delivery.get("formation_message_id"),
+                ready_channel_id=delivery.get("ready_channel_id"),
+                ready_message_id=delivery.get("ready_message_id"),
+                match_ready_notified=bool(delivery.get("match_ready_notified", False)),
             ),
             created_at=_decode_time(row["created_at"]),
             updated_at=_decode_time(row["updated_at"]),
@@ -717,6 +833,10 @@ class SQLitePartyRepository:
             mode=row["mode"], region=row["region"], format=row["format"],
             voice_required=bool(row["voice_required"]),
             skill_band=row["skill_band"], notes=row["notes"],
+            # Rows created before Issue #63 have no stored queue_code; derive
+            # one on read rather than requiring a one-time backfill migration.
+            queue_code=row["queue_code"] or generate_queue_code(row["lobby_id"]),
+            display_name=row["display_name"],
         )
 
     @staticmethod
@@ -729,6 +849,9 @@ class SQLitePartyRepository:
                 "team_channel_ids": list(delivery.team_channel_ids),
                 "match_channel_id": delivery.match_channel_id,
                 "formation_message_id": delivery.formation_message_id,
+                "ready_channel_id": delivery.ready_channel_id,
+                "ready_message_id": delivery.ready_message_id,
+                "match_ready_notified": delivery.match_ready_notified,
             },
             separators=(",", ":"), sort_keys=True,
         )

@@ -593,7 +593,7 @@ class SQLitePartyRepository:
             return changed
 
     def recover_active(self, guild_id: int | None = None) -> list[RecoveryRecord]:
-        self._expire_due_recruitment(guild_id)
+        self.expire_due_recruitment(guild_id)
         placeholders = ",".join("?" for _ in ACTIVE_STATES)
         params: list[object] = [state.value for state in ACTIVE_STATES]
         query = f"SELECT lobby_id,guild_id FROM party_lobbies WHERE state IN ({placeholders})"
@@ -608,8 +608,16 @@ class SQLitePartyRepository:
                 for row in rows
             ]
 
-    def _expire_due_recruitment(self, guild_id: int | None = None) -> None:
-        """Expire elapsed pre-active lobbies before returning recovery work."""
+    def expire_due_recruitment(self, guild_id: int | None = None) -> list[PartyLobby]:
+        """Expire elapsed pre-active lobbies and return the ones just expired.
+
+        Issue #63: ``recover_active()`` calls this as a side effect and then
+        queries for non-terminal lobbies, which by construction can never
+        include a lobby this same call just moved to the terminal EXPIRED
+        state. Callers that need to *project* an expiry onto Discord (e.g.
+        disabling a stale public card) must use this return value directly
+        rather than trying to infer it from ``recover_active()``'s list.
+        """
         expirable = (
             LobbyState.OPEN,
             LobbyState.FULL,
@@ -627,6 +635,7 @@ class SQLitePartyRepository:
             query += " AND guild_id=?"
             params.append(guild_id)
 
+        expired: list[PartyLobby] = []
         with self._transaction() as conn:
             for row in conn.execute(query, params).fetchall():
                 lobby = self._require(conn, row["guild_id"], row["lobby_id"])
@@ -661,6 +670,8 @@ class SQLitePartyRepository:
                     None,
                     {"reason": "expires_at elapsed"},
                 )
+                expired.append(changed)
+        return expired
 
     def audit_events(self, guild_id: int, lobby_id: str) -> list[AuditEvent]:
         with self._connect() as conn:

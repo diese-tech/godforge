@@ -614,6 +614,17 @@ class PartyLobbyService:
                 ephemeral=True,
             )
             return
+        # Issue #63 locked-in edge case: starting a *new* queue seats the
+        # organizer as its first participant, so the one-active-queue-per-
+        # player guard applies here too — otherwise an organizer already
+        # committed elsewhere could spin up (and get double-booked into) a
+        # second queue.
+        existing_other = await self.find_active_queue_for_player(
+            guild_id, interaction.user.id
+        )
+        if existing_other is not None:
+            await self._reject_double_booking(interaction, existing_other)
+            return
         test_mode = deps.settings_module.get_guild_settings(str(guild_id))["managed"].get(
             "testMode",
             False,
@@ -691,7 +702,7 @@ class PartyLobbyService:
                 f"You're already in **{lobby.display_title()}**.", ephemeral=True
             )
             return
-        existing_other = deps.party_repository.find_active_lobby_for_player(
+        existing_other = await self.find_active_queue_for_player(
             guild_id, interaction.user.id, exclude_lobby_id=lobby.lobby_id
         )
         if existing_other is not None:
@@ -733,6 +744,33 @@ class PartyLobbyService:
             view=deps.join_preferences_view(join_handler),
             ephemeral=True,
         )
+
+    async def find_active_queue_for_player(
+        self, guild_id: int, user_id: int, *, exclude_lobby_id: str | None = None
+    ):
+        """The player's other active queue in this guild, if any.
+
+        Issue #63 locked-in rule: one active queue per player per guild.
+        A waitlisted player is *not* written to the durable
+        ``party_participants`` table (only active-roster members are), so a
+        check against ``lobby.participant()`` alone would miss them and let
+        them double-book — this also consults the live queue's
+        active/waitlist membership, which is where a waitlisted player
+        actually lives until they're promoted.
+        """
+        deps = self.deps
+        for record in deps.party_repository.recover_active(guild_id):
+            lobby = record.lobby
+            if lobby.lobby_id == exclude_lobby_id:
+                continue
+            if lobby.participant(user_id) is not None:
+                return lobby
+            queue = await deps.party_queue_service.get(lobby.lobby_id)
+            if queue is not None and any(
+                member.user_id == user_id for member in (*queue.active, *queue.waitlist)
+            ):
+                return lobby
+        return None
 
     async def _reject_double_booking(
         self, interaction: discord.Interaction, existing_lobby
@@ -784,7 +822,7 @@ class PartyLobbyService:
             return
         # Issue #63 locked-in edge case: a player may only be active in one
         # queue per guild at a time. Checked before any state changes.
-        existing_other = deps.party_repository.find_active_lobby_for_player(
+        existing_other = await self.find_active_queue_for_player(
             guild_id, interaction.user.id, exclude_lobby_id=lobby_id
         )
         if existing_other is not None:
@@ -917,13 +955,30 @@ class PartyLobbyService:
     async def _process_leave(
         self, interaction: discord.Interaction, lobby_id: str, user_id: int
     ):
+        """Leave a queue from any context — the regular Leave button, or the
+        cross-queue "Leave That Queue" double-booking recovery action.
+
+        Issue #63 fix: a departure during an active ready check must behave
+        like the Ready Check Drop button (the whole roster's ready state
+        resets and the lobby reopens to OPEN), not like a plain queue
+        ``leave()`` — otherwise the queue is left stuck in READY_CHECK with
+        a roster that can now never all become Ready again.
+        """
         deps = self.deps
         guild_id = interaction.guild_id
         lobby = deps.party_repository.get(guild_id, lobby_id)
         if lobby is None:
             return None
-        await self.ensure_party_queue(lobby)
-        queue, promoted_id = await deps.party_queue_service.leave(lobby_id, user_id)
+        queue = await self.ensure_party_queue(lobby)
+        dropping_from_ready_check = lobby.state is LobbyState.READY_CHECK and any(
+            member.user_id == user_id for member in queue.active
+        )
+        if dropping_from_ready_check:
+            queue, promoted_id = await deps.party_queue_service.respond(
+                lobby_id, user_id, ReadyStatus.DROP
+            )
+        else:
+            queue, promoted_id = await deps.party_queue_service.leave(lobby_id, user_id)
         changed = deps.party_repository.remove_participant(
             guild_id, lobby_id, user_id,
             operation_id=f"discord:{interaction.id}:leave",
@@ -941,6 +996,11 @@ class PartyLobbyService:
                     captain=promoted.captain,
                 ),
                 operation_id=f"discord:{interaction.id}:promote:{promoted_id}",
+            )
+        if dropping_from_ready_check and changed.state is LobbyState.READY_CHECK:
+            changed = deps.party_repository.transition(
+                guild_id, lobby_id, LobbyState.OPEN,
+                operation_id=f"discord:{interaction.id}:reopen",
             )
         changed = await self._apply_organizer_succession(
             guild_id, lobby_id, changed, user_id,
@@ -1012,6 +1072,11 @@ class PartyLobbyService:
                 except (PermissionError, ValueError) as exc:
                     await modal_interaction.response.send_message(str(exc), ephemeral=True)
                     return
+                if renamed.state in {LobbyState.OPEN, LobbyState.FULL}:
+                    renamed = deps.party_repository.touch_recruiting_activity(
+                        guild_id, lobby_id,
+                        operation_id=f"discord:{modal_interaction.id}:rename-touch",
+                    )
                 if modal_interaction.guild is not None:
                     await self.refresh_public_lobby_card(renamed, modal_interaction.guild)
                 await modal_interaction.response.send_message(
@@ -1107,6 +1172,16 @@ class PartyLobbyService:
             if queue.status is not QueueStatus.OPEN:
                 await interaction.response.send_message(
                     "A ready check is already active or this queue is closed.",
+                    ephemeral=True,
+                )
+                return
+            # A manually-started ready check on an odd/undersized roster can
+            # never satisfy "everyone ready" — reject it up front rather than
+            # stranding the queue outside recruiting with no way to finish.
+            if len(queue.active) < 2 or len(queue.active) % 2:
+                await interaction.response.send_message(
+                    "Automatic formation needs an even roster of at least 2 active "
+                    "players before a ready check can start.",
                     ephemeral=True,
                 )
                 return
@@ -1766,13 +1841,20 @@ class PartyLobbyService:
         organizer's play channel (if configured) is notified either way.
 
         This pass also sweeps every guild's recruiting queues for the
-        60-minute inactivity expiry (Issue #63): ``recover_active()``
-        performs that state transition internally as a side effect of
-        listing active lobbies, so simply calling it here (as the periodic
-        cleanup hook) is what keeps idle queues from lingering forever even
-        with no further interactions to trigger the sweep organically.
+        60-minute inactivity expiry (Issue #63) and disables/relabels each
+        newly-expired queue's public card. ``recover_active()`` performs the
+        same state transition internally, but its own return value can never
+        include a lobby it just moved to the terminal EXPIRED state — so the
+        explicit ``expire_due_recruitment()`` call below is what a card
+        refresh has to key off of. Calling it here (as the periodic cleanup
+        hook) is also what keeps idle queues from expiring at all when no
+        further interaction ever triggers the sweep organically.
         """
         deps = self.deps
+        for expired_lobby in deps.party_repository.expire_due_recruitment():
+            guild = ctx.get_guild(expired_lobby.guild_id)
+            if guild is not None:
+                await self.refresh_public_lobby_card(expired_lobby, guild)
         for record in deps.party_repository.recover_active():
             lobby = record.lobby
             if lobby.state is not LobbyState.READY_CHECK:

@@ -85,6 +85,7 @@ async def test_create_wizard_delegates_a_complete_constrained_payload_once():
             "voice_required": True,
             "skill_band": "intermediate",
             "notes": "chill games",
+            "queue_name": "Late Night Inhouses",
         },
     )
     interaction = _interaction()
@@ -101,6 +102,7 @@ async def test_create_wizard_delegates_a_complete_constrained_payload_once():
             "voice_required": True,
             "skill_band": "intermediate",
             "notes": "chill games",
+            "queue_name": "Late Night Inhouses",
         },
     )
 

@@ -173,15 +173,22 @@ class _WizardButton(discord.ui.Button):
 
 
 class LobbyNotesModal(discord.ui.Modal):
-    """The only free-form input in lobby configuration."""
+    """The only free-form inputs in lobby configuration: name and notes."""
 
     def __init__(self, owner) -> None:
         super().__init__(
-            title="Lobby Notes",
-            custom_id="godforge:lobby:create:notes-modal:v2",
+            title="Queue Details",
+            custom_id="godforge:lobby:create:notes-modal:v3",
             timeout=900,
         )
         self.owner = owner
+        self.queue_name = discord.ui.TextInput(
+            label="Queue name (optional)",
+            custom_id="queue_name",
+            required=False,
+            max_length=40,
+            default=str(owner.state.get("queue_name") or ""),
+        )
         self.notes = discord.ui.TextInput(
             label="Optional notes",
             custom_id="notes",
@@ -190,10 +197,12 @@ class LobbyNotesModal(discord.ui.Modal):
             max_length=500,
             default=str(owner.state.get("notes") or ""),
         )
+        self.add_item(self.queue_name)
         self.add_item(self.notes)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        self.owner.state["notes"] = str(self.notes).strip()
+        self.owner.state["queue_name"] = str(self.queue_name.value).strip()
+        self.owner.state["notes"] = str(self.notes.value).strip()
         await interaction.response.edit_message(
             embed=self.owner.summary_embed(), view=self.owner
         )
@@ -275,7 +284,7 @@ class CreateLobbyWizardView(discord.ui.View):
             )
         )
         for action, label, style, custom_id in (
-            ("notes", "Add Notes", discord.ButtonStyle.secondary, "notes"),
+            ("notes", "Name / Notes", discord.ButtonStyle.secondary, "notes"),
             ("create", "Create Lobby", discord.ButtonStyle.success, "confirm"),
             ("back", "Back", discord.ButtonStyle.secondary, "back"),
             ("cancel", "Cancel", discord.ButtonStyle.danger, "cancel"),
@@ -330,6 +339,7 @@ class CreateLobbyWizardView(discord.ui.View):
             "voice_required": bool(self.state["voice_required"]),
             "skill_band": self.state["skill_band"],
             "notes": str(self.state.get("notes") or ""),
+            "queue_name": str(self.state.get("queue_name") or ""),
         }
 
     def _require(self, keys) -> None:
@@ -348,6 +358,8 @@ class CreateLobbyWizardView(discord.ui.View):
             + "**",
             f"Skill: **{self.state.get('skill_band', 'not selected')}**",
         ]
+        if self.state.get("queue_name"):
+            lines.insert(0, f"Name: **{self.state['queue_name']}**")
         if self.state.get("notes"):
             lines.append(f"Notes: {self.state['notes']}")
         return discord.Embed(

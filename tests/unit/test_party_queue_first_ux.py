@@ -26,7 +26,7 @@ import pytest
 import bot
 from utils.party import DiscordDelivery, LobbyState, Participant
 from utils.party_draft import PartyDraftLaunchRepository
-from utils.party_queue import InMemoryPartyQueueRepository, PartyQueueService
+from utils.party_queue import InMemoryPartyQueueRepository, PartyQueueService, QueueStatus
 from utils.party_store import SQLitePartyRepository
 from utils.match_history import MatchHistoryRepository
 from utils.scrims import ScrimRepository
@@ -622,3 +622,137 @@ async def test_restart_recovery_restores_controls_for_every_active_stage(
     assert play_channel.send.await_count == 2
     assert party.get(1, open_lobby.lobby_id).delivery.panel_channel_id == 600
     assert party.get(1, rc_lobby.lobby_id).delivery.ready_channel_id == 600
+
+
+# -- Post-review-comment fixes -----------------------------------------------
+
+
+async def test_manual_ready_check_rejects_odd_or_undersized_roster(party_repos):
+    party, *_ = party_repos
+    lobby = party.create(guild_id=1, organizer_id=1, capacity=4, operation_id="create-1")
+    party.save_participant(1, lobby.lobby_id, Participant(1), operation_id="j1")
+    party.save_participant(1, lobby.lobby_id, Participant(2), operation_id="j2")
+    party.save_participant(1, lobby.lobby_id, Participant(3), operation_id="j3")
+    interaction = _interaction(user_id=1, message=_lobby_footer_message(lobby.lobby_id))
+
+    await bot._handle_lobby_card_action(interaction, "ready_check")
+
+    assert party.get(1, lobby.lobby_id).state is LobbyState.OPEN
+    reply = interaction.response.send_message.await_args.args[0]
+    assert "even roster" in reply.lower()
+
+
+async def test_expired_queue_card_is_disabled_by_the_periodic_sweep(party_repos):
+    from utils.lifecycle import LifecycleContext
+
+    party, *_ = party_repos
+    lobby = party.create(
+        guild_id=1, organizer_id=1, capacity=4, operation_id="create-1",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+    party.set_delivery(
+        1, lobby.lobby_id, DiscordDelivery(panel_channel_id=600, panel_message_id=601),
+        operation_id="delivery",
+    )
+    public_message = MagicMock()
+    public_message.edit = AsyncMock()
+    public_channel = MagicMock()
+    public_channel.fetch_message = AsyncMock(return_value=public_message)
+    guild = _guild(1, channels={600: public_channel})
+    ctx = MagicMock(spec=LifecycleContext)
+    ctx.get_guild = lambda guild_id: guild if guild_id == 1 else None
+    ctx.get_channel = lambda channel_id: None
+
+    await bot.party_lobby_service.expire_ready_checks(ctx)
+
+    assert party.get(1, lobby.lobby_id).state is LobbyState.EXPIRED
+    public_message.edit.assert_awaited_once()
+    assert public_message.edit.await_args.kwargs["view"] is None
+    refreshed_embed = public_message.edit.await_args.kwargs["embed"]
+    assert "expired" in str(refreshed_embed.to_dict()).lower()
+
+
+async def test_leaving_via_recovery_during_ready_check_reopens_the_queue(party_repos):
+    party, queue_service, *_ = party_repos
+    lobby = party.create(guild_id=1, organizer_id=1, capacity=2, operation_id="create-1")
+    party.save_participant(1, lobby.lobby_id, Participant(1), operation_id="j1")
+    party.save_participant(1, lobby.lobby_id, Participant(2), operation_id="j2")
+    await queue_service.create(lobby.lobby_id, 2)
+    await queue_service.join(lobby.lobby_id, 1, ())
+    await queue_service.join(lobby.lobby_id, 2, ())
+    await queue_service.start_ready_check(lobby.lobby_id)
+    party.transition(1, lobby.lobby_id, LobbyState.FULL, operation_id="full")
+    party.transition(1, lobby.lobby_id, LobbyState.READY_CHECK, operation_id="ready")
+    await queue_service.respond(lobby.lobby_id, 1, "ready")
+
+    interaction = _interaction(user_id=2)
+    changed = await bot.party_lobby_service._process_leave(interaction, lobby.lobby_id, 2)
+
+    assert changed.state is LobbyState.OPEN
+    queue = await queue_service.get(lobby.lobby_id)
+    assert queue.status is QueueStatus.OPEN
+    assert queue.ready == {}
+    assert not any(p.user_id == 2 for p in changed.participants)
+
+
+async def test_create_queue_rejects_organizer_already_active_elsewhere(party_repos):
+    party, *_ = party_repos
+    first = party.create(guild_id=1, organizer_id=9, capacity=4, operation_id="create-1")
+    party.save_participant(1, first.lobby_id, Participant(9), operation_id="j9")
+    interaction = _interaction(user_id=9)
+    payload = {
+        "party_size": 4, "mode": "conquest", "region": "na", "format": "5v5",
+        "voice_required": False, "skill_band": "", "notes": "",
+    }
+
+    await bot._handle_create_lobby_submission(interaction, payload)
+
+    # Only the original queue exists — no second queue was created.
+    assert len(party.recover_active(1)) == 1
+    reply = interaction.response.send_message.await_args.args[0]
+    assert "already in" in reply
+
+
+async def test_waitlisted_player_is_caught_by_the_one_queue_guard(party_repos):
+    party, queue_service, *_ = party_repos
+    first = party.create(guild_id=1, organizer_id=1, capacity=2, operation_id="create-1")
+    party.save_participant(1, first.lobby_id, Participant(1), operation_id="j1")
+    party.save_participant(1, first.lobby_id, Participant(3), operation_id="j3")
+    await bot._ensure_party_queue(party.get(1, first.lobby_id))
+    # User 5 waitlists on the first (full) queue — never written to
+    # party_participants, only tracked in the live queue's waitlist lane.
+    waitlist_interaction = _interaction(
+        user_id=5, message=_lobby_footer_message(first.lobby_id)
+    )
+    payload = {"primary_role": "mid", "secondary_role": "", "fill": False}
+    await bot._join_lobby_from_preferences(waitlist_interaction, first.lobby_id, payload)
+    queue = await queue_service.get(first.lobby_id)
+    assert any(member.user_id == 5 for member in queue.waitlist)
+
+    second = party.create(guild_id=1, organizer_id=2, capacity=4, operation_id="create-2")
+    party.save_participant(1, second.lobby_id, Participant(2), operation_id="j2")
+    second_interaction = _interaction(
+        user_id=5, message=_lobby_footer_message(second.lobby_id)
+    )
+
+    await bot._handle_lobby_card_action(second_interaction, "join")
+
+    assert not any(p.user_id == 5 for p in party.get(1, second.lobby_id).participants)
+    reply = second_interaction.response.send_message.await_args.args[0]
+    assert "already in" in reply
+
+
+async def test_rename_extends_the_recruiting_expiry_clock(party_repos):
+    party, *_ = party_repos
+    soon = datetime.now(timezone.utc) + timedelta(seconds=5)
+    lobby = party.create(
+        guild_id=1, organizer_id=1, capacity=4, operation_id="create-1", expires_at=soon,
+    )
+    interaction = _interaction(user_id=1, message=_lobby_footer_message(lobby.lobby_id))
+
+    await bot._handle_lobby_card_action(interaction, "rename")
+    modal = interaction.response.send_modal.await_args.args[0]
+    modal = type(modal)(modal._on_submit, "Renamed Queue")
+    await modal.on_submit(interaction)
+
+    assert party.get(1, lobby.lobby_id).expires_at > soon

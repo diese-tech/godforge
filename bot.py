@@ -98,11 +98,7 @@ from utils.match_actions import (
 )
 from utils.party_lobby import PartyLobbyDeps, PartyLobbyFeature, PartyLobbyService
 from utils.party_room_command import PartyRoomCommandDeps, register_party_room_command
-from utils.party_setup_command import (
-    PartySetupCommandDeps,
-    register_party_reset_command,
-    register_party_setup_command,
-)
+from utils.party_setup_command import PartySetupCommandDeps, register_party_setup_command
 from utils.schedule_commands import ScheduleCommandDeps, register_schedule_commands
 from utils.scrim_commands import ScrimCommandDeps, register_scrim_commands
 from utils.session_commands import SessionCommandHandler
@@ -863,8 +859,6 @@ _party_setup_deps = PartySetupCommandDeps(
 )
 register_party_setup_command(party_commands, _party_setup_deps)
 party_setup = party_commands.setup
-register_party_reset_command(party_commands, _party_setup_deps)
-party_reset = party_commands.reset
 
 
 # /party room is owned by the party-room-command feature module (Issue #48);

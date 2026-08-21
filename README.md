@@ -223,6 +223,7 @@ Party setup and temporary-room controls use Discord slash commands:
 | Command | Result |
 | --- | --- |
 | `/party setup` | Provision the Play panel, managed roles, and room category |
+| `/party reset` | Delete GodForge's managed setup resources and clear stored config so `/party setup` can start clean; previews by default, `confirm:True` to execute |
 | `/party room` | Organizer-only temporary-room controls for one lobby |
 | `/party report` | Organizer/staff lookup for a guild-scoped room closure report |
 

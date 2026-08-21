@@ -9,6 +9,7 @@ their own dedicated unit tests; this focuses on party_setup's own wiring.
 
 from unittest.mock import AsyncMock, MagicMock
 
+import discord
 import pytest
 
 import bot
@@ -128,3 +129,132 @@ async def test_setup_test_mode_flag_is_stored(tmp_settings):
     await bot.party_setup.callback(interaction, test_mode=True)
     saved = settings_mod.get_guild_settings(str(guild.id))
     assert saved["managed"]["testMode"] is True
+
+
+async def test_play_channel_created_with_a_bot_self_overwrite(tmp_settings):
+    # A channel-specific overwrite for the bot survives a plain category
+    # move (Discord only clears it if someone explicitly syncs
+    # permissions), unlike purely inherited/ambient access.
+    guild = _guild()
+    interaction = _interaction(guild)
+    await bot.party_setup.callback(interaction)
+    kwargs = guild.create_text_channel.await_args.kwargs
+    overwrite = kwargs["overwrites"][guild.me]
+    assert overwrite.view_channel is True
+    assert overwrite.send_messages is True
+    assert overwrite.embed_links is True
+    assert overwrite.read_message_history is True
+
+
+# -- /party reset ---------------------------------------------------------
+
+
+async def test_reset_requires_guild():
+    interaction = _interaction(None)
+    interaction.guild = None
+    await bot.party_reset.callback(interaction)
+    reply = interaction.response.send_message.call_args.args[0]
+    assert "Discord server" in reply
+
+
+async def test_reset_requires_manage_guild_permission():
+    guild = _guild()
+    interaction = _interaction(guild, manage_guild=False)
+    await bot.party_reset.callback(interaction)
+    reply = interaction.response.send_message.call_args.args[0]
+    assert "Manage Server" in reply
+
+
+async def test_reset_with_nothing_stored_reports_nothing_to_do(tmp_settings):
+    guild = _guild()
+    interaction = _interaction(guild)
+    await bot.party_reset.callback(interaction)
+    reply = interaction.followup.send.call_args.args[0]
+    assert "Nothing is currently stored" in reply
+
+
+async def test_reset_dry_run_previews_without_deleting_or_clearing(tmp_settings):
+    from utils import settings as settings_mod
+
+    settings_mod.update_guild_settings(
+        "1",
+        {
+            "managed": {
+                "playChannelId": "6000", "playMessageId": "7000",
+                "roomCategoryId": "5000", "roleIds": {"solo": "8001"},
+            }
+        },
+    )
+    guild = _guild()
+    interaction = _interaction(guild)
+
+    await bot.party_reset.callback(interaction, confirm=False)
+
+    reply = interaction.followup.send.call_args.args[0]
+    assert "Play channel" in reply
+    assert "Room category" in reply
+    assert "Nothing was changed" in reply
+    saved = settings_mod.get_guild_settings("1")
+    assert saved["managed"]["playChannelId"] == "6000"
+    assert saved["managed"]["roleIds"]["solo"] == "8001"
+
+
+async def test_reset_confirmed_deletes_resources_and_clears_settings(tmp_settings):
+    from utils import settings as settings_mod
+
+    settings_mod.update_guild_settings(
+        "1",
+        {
+            "managed": {
+                "playChannelId": "6000", "playMessageId": "7000",
+                "roomCategoryId": "5000",
+                "roleIds": {"solo": "8001", "jungle": "8002"},
+            }
+        },
+    )
+    guild = _guild()
+    channel = MagicMock(id=6000)
+    channel.delete = AsyncMock()
+    category = MagicMock(id=5000)
+    category.delete = AsyncMock()
+    role_solo = MagicMock(id=8001)
+    role_solo.delete = AsyncMock()
+    guild.get_channel = lambda cid: {6000: channel, 5000: category}.get(cid)
+    # The jungle role was already deleted out-of-band — resolves to None.
+    guild.get_role = lambda rid: role_solo if rid == 8001 else None
+    interaction = _interaction(guild)
+
+    await bot.party_reset.callback(interaction, confirm=True)
+
+    channel.delete.assert_awaited_once()
+    category.delete.assert_awaited_once()
+    role_solo.delete.assert_awaited_once()
+    saved = settings_mod.get_guild_settings("1")
+    assert saved["managed"]["playChannelId"] == ""
+    assert saved["managed"]["playMessageId"] == ""
+    assert saved["managed"]["roomCategoryId"] == ""
+    assert saved["managed"]["roleIds"]["solo"] == ""
+    assert saved["managed"]["roleIds"]["jungle"] == ""
+    reply = interaction.followup.send.call_args.args[0]
+    assert "reset" in reply.lower()
+    assert "already gone" in reply.lower()
+
+
+async def test_reset_reports_deletion_failures_but_still_clears_settings(tmp_settings):
+    from utils import settings as settings_mod
+
+    settings_mod.update_guild_settings("1", {"managed": {"playChannelId": "6000"}})
+    guild = _guild()
+    channel = MagicMock(id=6000)
+    channel.delete = AsyncMock(side_effect=discord.DiscordException("Missing Permissions"))
+    guild.get_channel = lambda cid: channel if cid == 6000 else None
+    guild.get_role = lambda rid: None
+    interaction = _interaction(guild)
+
+    await bot.party_reset.callback(interaction, confirm=True)
+
+    saved = settings_mod.get_guild_settings("1")
+    assert saved["managed"]["playChannelId"] == ""
+    reply = interaction.followup.send.call_args.args[0]
+    assert "Could not delete" in reply
+    assert "Missing Permissions" in reply

@@ -24,7 +24,7 @@ from utils.guild_setup import (
     SetupOperationError,
     SetupReferences,
 )
-from utils.managed_roles import ManagedRoleError, reconcile as reconcile_roles
+from utils.managed_roles import ROLE_DEFINITIONS, ManagedRoleError, reconcile as reconcile_roles
 
 
 def play_panel_embed() -> discord.Embed:
@@ -95,9 +95,23 @@ class DiscordGuildSetupOperations:
                 "A channel named #godforge-play already exists but is not managed "
                 "by GodForge. Rename it or explicitly adopt it before retrying.",
             )
+        # A channel-specific overwrite for the bot itself (not just a role)
+        # survives a plain drag-to-a-new-category move, since Discord only
+        # replaces a channel's own overwrites when someone explicitly clicks
+        # "Sync Permissions" on the category. Without this, GodForge's access
+        # was purely inherited/ambient and a routine reorganization could
+        # silently strand the Play panel with no channel access at all.
         channel = await self.guild.create_text_channel(
             "godforge-play",
             reason="GodForge zero-config setup",
+            overwrites={
+                self.guild.me: discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    embed_links=True,
+                    read_message_history=True,
+                ),
+            },
         )
         return channel.id
 
@@ -286,3 +300,125 @@ def register_party_setup_command(
         )
 
     group.setup = setup
+
+
+def register_party_reset_command(
+    group: app_commands.Group, deps: PartySetupCommandDeps
+) -> None:
+    """Register `reset` onto the existing `/party` group.
+
+    Deletes every Discord resource `/party setup` is currently tracking for
+    this guild (Play channel, room category, managed cosmetic roles) and
+    clears the stored configuration, so a follow-up `/party setup` starts
+    completely clean instead of trying to adopt stale/broken IDs. This is a
+    destructive, hard-to-reverse recovery tool — it defaults to a dry run
+    and only deletes anything when explicitly confirmed.
+
+    Also attached as ``group.reset`` for direct invocation in tests.
+    """
+
+    @group.command(
+        name="reset",
+        description="Delete GodForge's managed setup resources and clear stored configuration",
+    )
+    @app_commands.describe(
+        confirm="Set true to actually delete resources; false previews what would happen",
+    )
+    async def reset(interaction: discord.Interaction, confirm: bool = False):
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "Run this command inside a Discord server.",
+                ephemeral=True,
+            )
+            return
+        if not getattr(interaction.user.guild_permissions, "manage_guild", False):
+            await interaction.response.send_message(
+                "You need Manage Server to reset GodForge.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild = interaction.guild
+        settings = deps.settings_module
+        managed = settings.get_guild_settings(str(guild.id))["managed"]
+
+        # (label, stored id string, resolved Discord object or None). Stored
+        # IDs are the only source of truth — nothing is looked up by name.
+        targets: list[tuple[str, str, object]] = []
+        channel_id = managed.get("playChannelId") or ""
+        targets.append(
+            ("Play channel", channel_id, guild.get_channel(int(channel_id)) if channel_id else None)
+        )
+        category_id = managed.get("roomCategoryId") or ""
+        targets.append(
+            ("Room category", category_id, guild.get_channel(int(category_id)) if category_id else None)
+        )
+        role_ids = managed.get("roleIds") or {}
+        for definition in ROLE_DEFINITIONS:
+            stored = role_ids.get(definition.key) or ""
+            targets.append(
+                (f"Role {definition.name}", stored, guild.get_role(int(stored)) if stored else None)
+            )
+
+        if not confirm:
+            found = [label for label, stored, _obj in targets if stored]
+            if not found:
+                await interaction.followup.send(
+                    "Nothing is currently stored for GodForge setup in this server. "
+                    "Run `/party setup` whenever you're ready.",
+                    ephemeral=True,
+                )
+                return
+            preview = "\n".join(f"- {label}" for label in found)
+            await interaction.followup.send(
+                "This would delete the following GodForge-managed resources and "
+                f"clear their stored configuration:\n{preview}\n\n"
+                "Nothing was changed. Run `/party reset confirm:True` to actually do this.",
+                ephemeral=True,
+            )
+            return
+
+        deleted: list[str] = []
+        failed: list[str] = []
+        for label, stored, obj in targets:
+            if not stored:
+                continue
+            if obj is None:
+                # Discord already has no record of it; only the stale
+                # stored reference needs clearing, done below.
+                deleted.append(f"{label} (already gone)")
+                continue
+            try:
+                await obj.delete(reason="GodForge setup reset")
+                deleted.append(label)
+            except discord.DiscordException as exc:
+                failed.append(f"{label}: {exc}")
+
+        # Clear every resource identity /party setup owns. Deliberately
+        # leaves unrelated settings (testMode, dashboard fields) untouched —
+        # reset targets exactly what setup created, nothing else.
+        settings.update_guild_settings(
+            str(guild.id),
+            {
+                "managed": {
+                    "playChannelId": "",
+                    "playMessageId": "",
+                    "roomCategoryId": "",
+                    "roleIds": {definition.key: "" for definition in ROLE_DEFINITIONS},
+                }
+            },
+            updated_by=f"discord:{interaction.user.id}",
+        )
+
+        lines = ["GodForge setup has been reset. Stored configuration is cleared."]
+        if deleted:
+            lines.append("Deleted: " + ", ".join(deleted))
+        if failed:
+            lines.append(
+                "Could not delete (likely a permissions issue — needs manual "
+                "cleanup in Discord): " + "; ".join(failed)
+            )
+        lines.append("Run `/party setup` to reconfigure.")
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+    group.reset = reset

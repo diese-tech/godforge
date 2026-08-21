@@ -21,6 +21,7 @@ scoped specifically to the behaviors #63 introduced or changed:
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
+import discord
 import pytest
 
 import bot
@@ -698,6 +699,7 @@ async def test_periodic_sweep_auto_closes_and_deletes_card_after_unanswered_grac
     )
     party.record_inactivity_prompt_sent(
         1, lobby.lobby_id, 600, 602, operation_id="prompt-1", grace_minutes=-1,
+        expected_expires_at=lobby.expires_at,
     )
     public_card_message = MagicMock()
     public_card_message.delete = AsyncMock()
@@ -1077,15 +1079,16 @@ async def test_keep_queue_open_resets_the_clock_and_deletes_the_stale_prompt(
     )
     party.record_inactivity_prompt_sent(
         1, lobby.lobby_id, 700, 800, operation_id="prompt-1",
+        expected_expires_at=lobby.expires_at,
     )
     prompt_message = MagicMock()
     prompt_message.delete = AsyncMock()
     prompt_channel = MagicMock(id=700)
     prompt_channel.fetch_message = AsyncMock(return_value=prompt_message)
     guild = _guild(1, channels={700: prompt_channel})
-    interaction = _interaction(
-        user_id=1, guild=guild, message=_lobby_footer_message(lobby.lobby_id)
-    )
+    prompt_click = _lobby_footer_message(lobby.lobby_id)
+    prompt_click.id = 800
+    interaction = _interaction(user_id=1, guild=guild, message=prompt_click)
 
     await bot.party_lobby_service.handle_inactivity_prompt_action(interaction, "keep_open")
 
@@ -1108,6 +1111,7 @@ async def test_close_queue_from_prompt_cancels_and_deletes_both_messages(party_r
     )
     party.record_inactivity_prompt_sent(
         1, lobby.lobby_id, 700, 800, operation_id="prompt-1",
+        expected_expires_at=lobby.expires_at,
     )
     card_message = MagicMock()
     card_message.delete = AsyncMock()
@@ -1118,9 +1122,9 @@ async def test_close_queue_from_prompt_cancels_and_deletes_both_messages(party_r
     prompt_channel = MagicMock(id=700)
     prompt_channel.fetch_message = AsyncMock(return_value=prompt_message)
     guild = _guild(1, channels={600: public_channel, 700: prompt_channel})
-    interaction = _interaction(
-        user_id=1, guild=guild, message=_lobby_footer_message(lobby.lobby_id)
-    )
+    prompt_click = _lobby_footer_message(lobby.lobby_id)
+    prompt_click.id = 800
+    interaction = _interaction(user_id=1, guild=guild, message=prompt_click)
 
     await bot.party_lobby_service.handle_inactivity_prompt_action(interaction, "close_queue")
 
@@ -1136,10 +1140,11 @@ async def test_only_the_organizer_can_respond_to_the_inactivity_prompt(party_rep
     lobby = party.create(guild_id=1, organizer_id=1, capacity=4, operation_id="create-1")
     party.record_inactivity_prompt_sent(
         1, lobby.lobby_id, 700, 800, operation_id="prompt-1",
+        expected_expires_at=lobby.expires_at,
     )
-    interaction = _interaction(
-        user_id=2, message=_lobby_footer_message(lobby.lobby_id)
-    )
+    prompt_click = _lobby_footer_message(lobby.lobby_id)
+    prompt_click.id = 800
+    interaction = _interaction(user_id=2, message=prompt_click)
 
     await bot.party_lobby_service.handle_inactivity_prompt_action(interaction, "close_queue")
 
@@ -1161,6 +1166,7 @@ async def test_joining_during_grace_period_implicitly_reprimes_and_clears_the_pr
     lobby = party.create(guild_id=1, organizer_id=1, capacity=4, operation_id="create-1")
     party.record_inactivity_prompt_sent(
         1, lobby.lobby_id, 700, 800, operation_id="prompt-1",
+        expected_expires_at=lobby.expires_at,
     )
     prompt_message = MagicMock()
     prompt_message.delete = AsyncMock()
@@ -1263,8 +1269,101 @@ async def test_periodic_sweep_does_not_post_a_second_prompt_once_one_exists(
     )
     party.record_inactivity_prompt_sent(
         1, lobby.lobby_id, 700, 800, operation_id="prompt-1",
+        expected_expires_at=lobby.expires_at,
     )
 
     due = party.due_for_inactivity_prompt(1)
 
     assert due == []
+
+
+# -- Codex review follow-up (PR #69) ------------------------------------------
+
+
+async def test_card_deletion_failure_retains_the_delivery_ref_for_retry(party_repos):
+    # A transient Discord failure while deleting the card must not clear the
+    # durable delivery ref — otherwise terminal_lobbies_with_undeleted_card()
+    # can never rediscover it, orphaning the card in the Play channel
+    # forever instead of retrying on the next sweep.
+    party, *_ = party_repos
+    lobby = party.create(guild_id=1, organizer_id=1, capacity=4, operation_id="create-1")
+    party.set_delivery(
+        1, lobby.lobby_id, DiscordDelivery(panel_channel_id=600, panel_message_id=601),
+        operation_id="delivery",
+    )
+    party.transition(1, lobby.lobby_id, LobbyState.CANCELLED, operation_id="cancel-1")
+    public_channel = MagicMock(id=600)
+    public_channel.fetch_message = AsyncMock(
+        side_effect=discord.Forbidden(MagicMock(), "missing permissions")
+    )
+    guild = _guild(1, channels={600: public_channel})
+
+    changed = party.get(1, lobby.lobby_id)
+    result = await bot.party_lobby_service.delete_public_lobby_card(changed, guild)
+
+    assert result.delivery.panel_channel_id == 600
+    assert result.delivery.panel_message_id == 601
+    stored = party.get(1, lobby.lobby_id)
+    assert stored.delivery.panel_channel_id == 600
+    assert stored.delivery.panel_message_id == 601
+    # Still discoverable by the self-healing sweep for a later retry.
+    assert [l.lobby_id for l in party.terminal_lobbies_with_undeleted_card(1)] == [
+        lobby.lobby_id
+    ]
+
+
+async def test_stale_prompt_message_is_rejected_once_a_newer_one_exists(party_repos):
+    # Models the scenario a Codex review caught: an older prompt (800) is
+    # still sitting in the channel with live buttons, but the lobby's
+    # durable state has since moved on to a different prompt (900). Only
+    # the currently-named prompt may act.
+    party, *_ = party_repos
+    lobby = party.create(guild_id=1, organizer_id=1, capacity=4, operation_id="create-1")
+    party.record_inactivity_prompt_sent(
+        1, lobby.lobby_id, 700, 900, operation_id="prompt-2",
+        expected_expires_at=lobby.expires_at,
+    )
+    stale_click = _lobby_footer_message(lobby.lobby_id)
+    stale_click.id = 800
+    interaction = _interaction(user_id=1, message=stale_click)
+
+    await bot.party_lobby_service.handle_inactivity_prompt_action(interaction, "close_queue")
+
+    assert party.get(1, lobby.lobby_id).state is LobbyState.OPEN
+    reply = interaction.response.send_message.await_args.args[0]
+    assert "no longer current" in reply.lower()
+
+
+async def test_prompt_posted_during_intervening_activity_is_discarded(party_repos):
+    # The compare-and-set guard in record_inactivity_prompt_sent(): if
+    # meaningful activity resets the clock while channel.send() for the
+    # prompt is in flight, the now-unwanted message must be deleted rather
+    # than durably recorded (which would either stomp the freshly-reset
+    # clock or attach a dangling prompt).
+    party, *_ = party_repos
+    lobby = party.create(
+        guild_id=1, organizer_id=1, capacity=4, operation_id="create-1",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+    # Simulate activity racing ahead of the in-flight prompt post.
+    party.touch_recruiting_activity(1, lobby.lobby_id, operation_id="race-touch")
+
+    prompt_message = MagicMock()
+    prompt_message.delete = AsyncMock()
+    prompt_channel = MagicMock(id=700)
+    prompt_channel.fetch_message = AsyncMock(return_value=prompt_message)
+    guild = _guild(1, channels={700: prompt_channel})
+
+    deps = bot.party_lobby_service.deps
+    recorded = deps.party_repository.record_inactivity_prompt_sent(
+        lobby.guild_id, lobby.lobby_id, 700, 800,
+        operation_id="prompt-race",
+        expected_expires_at=lobby.expires_at,  # the stale, pre-touch value
+    )
+    if recorded is None:
+        await bot.party_lobby_service._delete_message_best_effort(guild, 700, 800)
+
+    assert recorded is None
+    prompt_message.delete.assert_awaited_once()
+    changed = party.get(1, lobby.lobby_id)
+    assert changed.delivery.inactivity_prompt_message_id is None

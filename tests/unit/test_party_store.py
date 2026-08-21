@@ -194,6 +194,7 @@ def test_inactivity_prompt_sent_advances_the_grace_deadline(tmp_path):
 
     updated = repo.record_inactivity_prompt_sent(
         1, "elapsed", 600, 601, operation_id="prompt-1",
+        expected_expires_at=lobby.expires_at,
     )
 
     assert updated.delivery.inactivity_prompt_channel_id == 600
@@ -205,13 +206,14 @@ def test_inactivity_prompt_sent_advances_the_grace_deadline(tmp_path):
 
 def test_unanswered_grace_period_auto_closes_the_lobby(tmp_path):
     repo = repository(tmp_path)
-    repo.create(
+    lobby = repo.create(
         guild_id=1, organizer_id=2, capacity=5, lobby_id="elapsed",
         expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
         operation_id="create",
     )
     repo.record_inactivity_prompt_sent(
         1, "elapsed", 600, 601, operation_id="prompt-1", grace_minutes=-1,
+        expected_expires_at=lobby.expires_at,
     )
 
     expired = repo.expire_due_recruitment(1)
@@ -222,6 +224,30 @@ def test_unanswered_grace_period_auto_closes_the_lobby(tmp_path):
     event = repo.audit_events(1, "elapsed")[-1]
     assert event.event_type == "expired"
     assert event.metadata == {"reason": "expires_at elapsed"}
+
+
+def test_recording_a_prompt_is_rejected_if_the_clock_moved_underneath_it(tmp_path):
+    # Compare-and-set guard: if meaningful activity (or a state change)
+    # touched the lobby while the caller's channel.send() was in flight,
+    # the now-unwanted prompt must not be recorded — the caller is
+    # responsible for deleting the message it already posted.
+    repo = repository(tmp_path)
+    lobby = repo.create(
+        guild_id=1, organizer_id=2, capacity=5, lobby_id="elapsed",
+        expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+        operation_id="create",
+    )
+    stale_expected = lobby.expires_at
+    repo.touch_recruiting_activity(1, "elapsed", operation_id="touch-1")
+
+    result = repo.record_inactivity_prompt_sent(
+        1, "elapsed", 600, 601, operation_id="prompt-1",
+        expected_expires_at=stale_expected,
+    )
+
+    assert result is None
+    unchanged = repo.get(1, "elapsed")
+    assert unchanged.delivery.inactivity_prompt_message_id is None
 
 
 def test_ready_check_lobbies_are_not_covered_by_recruiting_expiry(tmp_path):

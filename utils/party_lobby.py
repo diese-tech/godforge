@@ -387,7 +387,7 @@ class PartyLobbyService:
         )
         return updated, True
 
-    async def _delete_message_best_effort(self, guild, channel_id, message_id) -> None:
+    async def _delete_message_best_effort(self, guild, channel_id, message_id) -> bool:
         """Best-effort delete of a stored channel/message pair.
 
         Shared by every Issue #66 cleanup path (terminal card deletion,
@@ -395,17 +395,30 @@ class PartyLobbyService:
         must never block or roll back the domain mutation that already
         succeeded, matching the existing best-effort convention for
         ``refresh_public_lobby_card``.
+
+        Returns ``True`` only once the message is actually gone (deleted, or
+        a 404 confirms it already was) — ``False`` for a channel we can't
+        resolve or a transient Discord failure. Callers that use this to
+        decide whether it's now safe to clear a durable delivery reference
+        must check the return value first: clearing on a transient failure
+        would permanently orphan the message from the one self-healing sweep
+        (``terminal_lobbies_with_undeleted_card``) that could otherwise
+        rediscover and finish deleting it later.
         """
         if guild is None or not channel_id or not message_id:
-            return
+            return False
         channel = guild.get_channel(channel_id)
         if channel is None or not hasattr(channel, "fetch_message"):
-            return
+            return False
         try:
             message = await channel.fetch_message(message_id)
             await message.delete()
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException, AttributeError):
+        except discord.NotFound:
+            return True
+        except (discord.Forbidden, discord.HTTPException, AttributeError):
             self.deps.log.exception("Could not delete a stale GodForge message")
+            return False
+        return True
 
     async def delete_public_lobby_card(self, lobby, guild):
         """Delete the canonical public queue card and retire its delivery ref.
@@ -416,15 +429,17 @@ class PartyLobbyService:
         "Queue expired" card cluttering the Play channel — unlike every
         other public-card mutation, this one removes the message instead of
         editing it. Best-effort like ``refresh_public_lobby_card``, but the
-        stored delivery ref is always cleared regardless of whether the
-        Discord delete itself succeeded, so a stale message ID is never
-        treated as if it were still live.
+        stored delivery ref is only cleared once the delete is confirmed —
+        on a transient failure it's left in place so the next periodic sweep
+        can retry, rather than silently orphaning the card forever.
         """
         deps = self.deps
         delivery = lobby.delivery
-        await self._delete_message_best_effort(
+        deleted = await self._delete_message_best_effort(
             guild, delivery.panel_channel_id, delivery.panel_message_id
         )
+        if not deleted:
+            return lobby
         return deps.party_repository.set_delivery(
             lobby.guild_id,
             lobby.lobby_id,
@@ -487,10 +502,18 @@ class PartyLobbyService:
                 "Could not post inactivity prompt for lobby %s", lobby.lobby_id
             )
             return
-        deps.party_repository.record_inactivity_prompt_sent(
+        recorded = deps.party_repository.record_inactivity_prompt_sent(
             lobby.guild_id, lobby.lobby_id, channel.id, message.id,
             operation_id=f"inactivity-prompt:{lobby.lobby_id}:{message.id}",
+            expected_expires_at=lobby.expires_at,
         )
+        if recorded is None:
+            # The lobby moved on (activity, a state transition, or a
+            # concurrent sweep) while channel.send() was in flight — this
+            # prompt is unwanted; nothing durable will ever reference it, so
+            # delete it rather than leave a dangling message with live
+            # buttons for a queue that no longer needs asking.
+            await self._delete_message_best_effort(guild, channel.id, message.id)
 
     async def handle_inactivity_prompt_action(
         self, interaction: discord.Interaction, action: str
@@ -506,6 +529,17 @@ class PartyLobbyService:
         if lobby is None or lobby.state not in {LobbyState.OPEN, LobbyState.FULL}:
             await interaction.response.send_message(
                 "That queue is no longer waiting on a response.", ephemeral=True,
+            )
+            return
+        # A prompt this stale can exist if a Discord delete once failed (or
+        # a newer prompt was posted since): the durable ref may have moved
+        # on to a different message, or been cleared entirely, while this
+        # older one is still sitting in the channel with live buttons. Only
+        # the prompt the lobby currently names is allowed to act.
+        current_message_id = getattr(interaction.message, "id", None)
+        if lobby.delivery.inactivity_prompt_message_id != current_message_id:
+            await interaction.response.send_message(
+                "This prompt is no longer current.", ephemeral=True,
             )
             return
         if interaction.user.id != lobby.organizer_id:

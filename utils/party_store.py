@@ -662,20 +662,37 @@ class SQLitePartyRepository:
         message_id: int,
         *,
         operation_id: str,
+        expected_expires_at: datetime | None,
         grace_minutes: int = 60,
-    ) -> PartyLobby:
+    ) -> PartyLobby | None:
         """Persist the posted confirmation prompt and start its grace deadline.
 
         Reuses ``expires_at`` for the second-stage deadline rather than
         adding a separate field — presence of the stored prompt message id
         is what distinguishes "grace period" from "still on the ordinary
         first-stage clock" everywhere else in this class.
+
+        ``expected_expires_at`` is a compare-and-set guard against the
+        ``channel.send()`` the caller just awaited: if meaningful activity
+        (or a state transition, or a concurrent sweep) already changed the
+        lobby while that Discord call was in flight, silently recording this
+        now-unwanted prompt would either overwrite a legitimately-reset
+        clock or attach a dangling prompt to a lobby that already moved on.
+        Returns ``None`` on a guard mismatch — the caller must then delete
+        the message it just posted, since nothing durable will ever
+        reference it.
         """
         fingerprint = f"inactivity-prompt:{guild_id}:{lobby_id}:{channel_id}:{message_id}"
         with self._transaction() as conn:
             if self._operation(conn, operation_id, fingerprint):
                 return self._require(conn, guild_id, lobby_id)
             lobby = self._require(conn, guild_id, lobby_id)
+            if (
+                lobby.state not in {LobbyState.OPEN, LobbyState.FULL}
+                or lobby.delivery.inactivity_prompt_message_id is not None
+                or lobby.expires_at != expected_expires_at
+            ):
+                return None
             new_delivery = replace(
                 lobby.delivery,
                 inactivity_prompt_channel_id=channel_id,

@@ -10,6 +10,7 @@ import discord
 
 LOBBY_CARD_CUSTOM_ID_PREFIX = "godforge:lobby:card"
 READY_CHECK_CUSTOM_ID_PREFIX = "godforge:lobby:ready-check"
+INACTIVITY_PROMPT_CUSTOM_ID_PREFIX = "godforge:lobby:inactivity"
 MATCH_RESULT_CUSTOM_ID_PREFIX = "godforge:match:result"
 MATCH_CONTINUITY_CUSTOM_ID_PREFIX = "godforge:match:continuity"
 MATCH_FORMATION_CUSTOM_ID_PREFIX = "godforge:match:formation"
@@ -43,6 +44,14 @@ READY_CHECK_ACTIONS = (
     ("ready", "Ready", discord.ButtonStyle.success),
     ("need_five", "Need 5 Minutes", discord.ButtonStyle.secondary),
     ("drop", "Drop", discord.ButtonStyle.danger),
+)
+
+# Issue #66: the organizer-only confirmation posted after 60 quiet minutes,
+# before a recruiting queue is given a further grace period rather than
+# expiring immediately.
+INACTIVITY_PROMPT_ACTIONS = (
+    ("keep_open", "Keep Queue Open", discord.ButtonStyle.success),
+    ("close_queue", "Close Queue", discord.ButtonStyle.danger),
 )
 
 MATCH_RESULT_ACTIONS = (
@@ -518,6 +527,24 @@ class ReadyCheckView(discord.ui.View):
                     style,
                     handler,
                     custom_id_prefix=READY_CHECK_CUSTOM_ID_PREFIX,
+                    row=0,
+                )
+            )
+
+
+class InactivityPromptView(discord.ui.View):
+    """Issue #66's organizer-only response to the inactivity-confirmation prompt."""
+
+    def __init__(self, handler: LobbyActionHandler) -> None:
+        super().__init__(timeout=None)
+        for action, label, style in INACTIVITY_PROMPT_ACTIONS:
+            self.add_item(
+                _LobbyActionButton(
+                    action,
+                    label,
+                    style,
+                    handler,
+                    custom_id_prefix=INACTIVITY_PROMPT_CUSTOM_ID_PREFIX,
                     row=0,
                 )
             )

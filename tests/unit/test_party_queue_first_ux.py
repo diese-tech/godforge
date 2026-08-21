@@ -426,7 +426,11 @@ async def test_leaving_the_other_queue_view_action_frees_the_player_up(
 # -- 8. Recruiting inactivity expiry -----------------------------------------
 
 
-async def test_recruiting_queue_expires_after_inactivity_window(party_repos):
+async def test_recruiting_queue_awaits_inactivity_prompt_instead_of_hard_expiring(
+    party_repos,
+):
+    # Issue #66: an elapsed recruiting clock no longer expires the queue
+    # directly — see the two-stage flow tested in section 8a/8b below.
     party, *_ = party_repos
     lobby = party.create(
         guild_id=1, organizer_id=1, capacity=4, operation_id="create-1",
@@ -435,8 +439,9 @@ async def test_recruiting_queue_expires_after_inactivity_window(party_repos):
 
     active = party.recover_active(1)
 
-    assert active == []
-    assert party.get(1, lobby.lobby_id).state is LobbyState.EXPIRED
+    assert len(active) == 1
+    assert active[0].lobby.lobby_id == lobby.lobby_id
+    assert party.get(1, lobby.lobby_id).state is LobbyState.OPEN
 
 
 async def test_join_activity_extends_the_expiry_clock(party_repos):
@@ -642,7 +647,44 @@ async def test_manual_ready_check_rejects_odd_or_undersized_roster(party_repos):
     assert "even roster" in reply.lower()
 
 
-async def test_expired_queue_card_is_disabled_by_the_periodic_sweep(party_repos):
+# -- 8a. Inactivity confirmation prompt (Issue #66) --------------------------
+
+
+async def test_periodic_sweep_posts_inactivity_prompt_for_a_quiet_queue(
+    party_repos, tmp_settings,
+):
+    import utils.settings as settings_mod
+    from utils.lifecycle import LifecycleContext
+
+    party, *_ = party_repos
+    lobby = party.create(
+        guild_id=1, organizer_id=1, capacity=4, operation_id="create-1",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+    settings_mod.update_guild_settings("1", {"managed": {"playChannelId": "700"}})
+    play_channel = MagicMock(id=700)
+    play_channel.send = AsyncMock(return_value=MagicMock(id=800))
+    guild = _guild(1, channels={700: play_channel})
+    ctx = MagicMock(spec=LifecycleContext)
+    ctx.get_guild = lambda guild_id: guild if guild_id == 1 else None
+    ctx.get_channel = lambda channel_id: None
+
+    await bot.party_lobby_service.expire_ready_checks(ctx)
+
+    play_channel.send.assert_awaited_once()
+    kwargs = play_channel.send.await_args.kwargs
+    assert kwargs["content"] == f"<@{lobby.organizer_id}>"
+    assert "still recruiting" in kwargs["embed"].title.lower()
+    changed = party.get(1, lobby.lobby_id)
+    assert changed.state is LobbyState.OPEN
+    assert changed.delivery.inactivity_prompt_channel_id == 700
+    assert changed.delivery.inactivity_prompt_message_id == 800
+    assert changed.expires_at > lobby.expires_at
+
+
+async def test_periodic_sweep_auto_closes_and_deletes_card_after_unanswered_grace(
+    party_repos,
+):
     from utils.lifecycle import LifecycleContext
 
     party, *_ = party_repos
@@ -654,10 +696,19 @@ async def test_expired_queue_card_is_disabled_by_the_periodic_sweep(party_repos)
         1, lobby.lobby_id, DiscordDelivery(panel_channel_id=600, panel_message_id=601),
         operation_id="delivery",
     )
-    public_message = MagicMock()
-    public_message.edit = AsyncMock()
-    public_channel = MagicMock()
-    public_channel.fetch_message = AsyncMock(return_value=public_message)
+    party.record_inactivity_prompt_sent(
+        1, lobby.lobby_id, 600, 602, operation_id="prompt-1", grace_minutes=-1,
+    )
+    public_card_message = MagicMock()
+    public_card_message.delete = AsyncMock()
+    prompt_message = MagicMock()
+    prompt_message.delete = AsyncMock()
+
+    def fetch_message(message_id):
+        return {601: public_card_message, 602: prompt_message}[message_id]
+
+    public_channel = MagicMock(id=600)
+    public_channel.fetch_message = AsyncMock(side_effect=fetch_message)
     guild = _guild(1, channels={600: public_channel})
     ctx = MagicMock(spec=LifecycleContext)
     ctx.get_guild = lambda guild_id: guild if guild_id == 1 else None
@@ -666,10 +717,11 @@ async def test_expired_queue_card_is_disabled_by_the_periodic_sweep(party_repos)
     await bot.party_lobby_service.expire_ready_checks(ctx)
 
     assert party.get(1, lobby.lobby_id).state is LobbyState.EXPIRED
-    public_message.edit.assert_awaited_once()
-    assert public_message.edit.await_args.kwargs["view"] is None
-    refreshed_embed = public_message.edit.await_args.kwargs["embed"]
-    assert "expired" in str(refreshed_embed.to_dict()).lower()
+    public_card_message.delete.assert_awaited_once()
+    prompt_message.delete.assert_awaited_once()
+    changed_delivery = party.get(1, lobby.lobby_id).delivery
+    assert changed_delivery.panel_channel_id is None
+    assert changed_delivery.panel_message_id is None
 
 
 async def test_leaving_via_recovery_during_ready_check_reopens_the_queue(party_repos):
@@ -983,3 +1035,236 @@ async def test_restart_recovery_does_not_warn_for_an_ordinary_ready_check(
 
     assert party.get(1, lobby.lobby_id).state is LobbyState.READY_CHECK
     mock_log.warning.assert_not_called()
+
+
+# -- Issue #66: recruiting inactivity confirmation + terminal card cleanup ---
+
+
+async def test_cancel_queue_deletes_the_card_instead_of_relabeling_it(party_repos):
+    party, *_ = party_repos
+    lobby = party.create(guild_id=1, organizer_id=1, capacity=4, operation_id="create-1")
+    party.set_delivery(
+        1, lobby.lobby_id, DiscordDelivery(panel_channel_id=600, panel_message_id=601),
+        operation_id="delivery",
+    )
+    card_message = MagicMock()
+    card_message.delete = AsyncMock()
+    public_channel = MagicMock(id=600)
+    public_channel.fetch_message = AsyncMock(return_value=card_message)
+    guild = _guild(1, channels={600: public_channel})
+    interaction = _interaction(
+        user_id=1, guild=guild, message=_lobby_footer_message(lobby.lobby_id)
+    )
+
+    await bot._handle_lobby_card_action(interaction, "cancel")
+
+    assert party.get(1, lobby.lobby_id).state is LobbyState.CANCELLED
+    card_message.delete.assert_awaited_once()
+    changed_delivery = party.get(1, lobby.lobby_id).delivery
+    assert changed_delivery.panel_channel_id is None
+    assert changed_delivery.panel_message_id is None
+    reply = interaction.response.send_message.await_args.args[0]
+    assert "cancelled" in reply.lower()
+
+
+async def test_keep_queue_open_resets_the_clock_and_deletes_the_stale_prompt(
+    party_repos,
+):
+    party, *_ = party_repos
+    lobby = party.create(
+        guild_id=1, organizer_id=1, capacity=4, operation_id="create-1",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+    party.record_inactivity_prompt_sent(
+        1, lobby.lobby_id, 700, 800, operation_id="prompt-1",
+    )
+    prompt_message = MagicMock()
+    prompt_message.delete = AsyncMock()
+    prompt_channel = MagicMock(id=700)
+    prompt_channel.fetch_message = AsyncMock(return_value=prompt_message)
+    guild = _guild(1, channels={700: prompt_channel})
+    interaction = _interaction(
+        user_id=1, guild=guild, message=_lobby_footer_message(lobby.lobby_id)
+    )
+
+    await bot.party_lobby_service.handle_inactivity_prompt_action(interaction, "keep_open")
+
+    changed = party.get(1, lobby.lobby_id)
+    assert changed.state is LobbyState.OPEN
+    assert changed.delivery.inactivity_prompt_channel_id is None
+    assert changed.delivery.inactivity_prompt_message_id is None
+    assert changed.expires_at > datetime.now(timezone.utc)
+    prompt_message.delete.assert_awaited_once()
+    reply = interaction.response.send_message.await_args.args[0]
+    assert "kept open" in reply.lower()
+
+
+async def test_close_queue_from_prompt_cancels_and_deletes_both_messages(party_repos):
+    party, *_ = party_repos
+    lobby = party.create(guild_id=1, organizer_id=1, capacity=4, operation_id="create-1")
+    party.set_delivery(
+        1, lobby.lobby_id, DiscordDelivery(panel_channel_id=600, panel_message_id=601),
+        operation_id="delivery",
+    )
+    party.record_inactivity_prompt_sent(
+        1, lobby.lobby_id, 700, 800, operation_id="prompt-1",
+    )
+    card_message = MagicMock()
+    card_message.delete = AsyncMock()
+    public_channel = MagicMock(id=600)
+    public_channel.fetch_message = AsyncMock(return_value=card_message)
+    prompt_message = MagicMock()
+    prompt_message.delete = AsyncMock()
+    prompt_channel = MagicMock(id=700)
+    prompt_channel.fetch_message = AsyncMock(return_value=prompt_message)
+    guild = _guild(1, channels={600: public_channel, 700: prompt_channel})
+    interaction = _interaction(
+        user_id=1, guild=guild, message=_lobby_footer_message(lobby.lobby_id)
+    )
+
+    await bot.party_lobby_service.handle_inactivity_prompt_action(interaction, "close_queue")
+
+    assert party.get(1, lobby.lobby_id).state is LobbyState.CANCELLED
+    card_message.delete.assert_awaited_once()
+    prompt_message.delete.assert_awaited_once()
+    reply = interaction.response.send_message.await_args.args[0]
+    assert "closed" in reply.lower()
+
+
+async def test_only_the_organizer_can_respond_to_the_inactivity_prompt(party_repos):
+    party, *_ = party_repos
+    lobby = party.create(guild_id=1, organizer_id=1, capacity=4, operation_id="create-1")
+    party.record_inactivity_prompt_sent(
+        1, lobby.lobby_id, 700, 800, operation_id="prompt-1",
+    )
+    interaction = _interaction(
+        user_id=2, message=_lobby_footer_message(lobby.lobby_id)
+    )
+
+    await bot.party_lobby_service.handle_inactivity_prompt_action(interaction, "close_queue")
+
+    assert party.get(1, lobby.lobby_id).state is LobbyState.OPEN
+    reply = interaction.response.send_message.await_args.args[0]
+    assert "organizer" in reply.lower()
+
+
+async def test_joining_during_grace_period_implicitly_reprimes_and_clears_the_prompt(
+    party_repos,
+):
+    # Issue #66: any meaningful recruiting activity during the grace period
+    # counts as implicit confirmation — the organizer never needs to click
+    # Keep Queue Open, and the now-stale prompt is cleaned up automatically.
+    party, *_ = party_repos
+    from utils.party import PlayerPreferences
+
+    party.set_player_preferences(1, 2, PlayerPreferences("support", "solo", True, False))
+    lobby = party.create(guild_id=1, organizer_id=1, capacity=4, operation_id="create-1")
+    party.record_inactivity_prompt_sent(
+        1, lobby.lobby_id, 700, 800, operation_id="prompt-1",
+    )
+    prompt_message = MagicMock()
+    prompt_message.delete = AsyncMock()
+    prompt_channel = MagicMock(id=700)
+    prompt_channel.fetch_message = AsyncMock(return_value=prompt_message)
+    guild = _guild(1, channels={700: prompt_channel})
+    interaction = _interaction(
+        user_id=2, guild=guild, message=_lobby_footer_message(lobby.lobby_id)
+    )
+
+    await bot._handle_lobby_card_action(interaction, "join")
+
+    changed = party.get(1, lobby.lobby_id)
+    assert any(p.user_id == 2 for p in changed.participants)
+    assert changed.delivery.inactivity_prompt_channel_id is None
+    assert changed.delivery.inactivity_prompt_message_id is None
+    prompt_message.delete.assert_awaited_once()
+
+
+async def test_ready_check_timeout_cancellation_deletes_the_public_card(party_repos):
+    from utils.lifecycle import LifecycleContext
+
+    party, queue_service, *_ = party_repos
+    lobby = party.create(guild_id=1, organizer_id=1, capacity=2, operation_id="create-1")
+    party.save_participant(1, lobby.lobby_id, Participant(1), operation_id="j1")
+    party.save_participant(1, lobby.lobby_id, Participant(2), operation_id="j2")
+    party.set_delivery(
+        1, lobby.lobby_id, DiscordDelivery(panel_channel_id=600, panel_message_id=601),
+        operation_id="delivery",
+    )
+    await queue_service.create(lobby.lobby_id, 2)
+    await queue_service.join(lobby.lobby_id, 1, ())
+    await queue_service.join(lobby.lobby_id, 2, ())
+    await queue_service.start_ready_check(lobby.lobby_id)
+    party.transition(1, lobby.lobby_id, LobbyState.FULL, operation_id="full")
+    party.transition(1, lobby.lobby_id, LobbyState.READY_CHECK, operation_id="ready")
+
+    # Force the ready-check deadline into the past directly, rather than
+    # waiting on the real 60-second timeout the fixture's service is
+    # configured with.
+    queue = await queue_service.get(lobby.lobby_id)
+    queue.ready_deadline = datetime.now(timezone.utc) - timedelta(seconds=1)
+    await queue_service._repository.save(queue)
+
+    card_message = MagicMock()
+    card_message.delete = AsyncMock()
+    public_channel = MagicMock(id=600)
+    public_channel.fetch_message = AsyncMock(return_value=card_message)
+    guild = _guild(1, channels={600: public_channel})
+    ctx = MagicMock(spec=LifecycleContext)
+    ctx.get_guild = lambda guild_id: guild if guild_id == 1 else None
+    ctx.get_channel = lambda channel_id: None
+
+    await bot.party_lobby_service.expire_ready_checks(ctx)
+
+    assert party.get(1, lobby.lobby_id).state is LobbyState.CANCELLED
+    card_message.delete.assert_awaited_once()
+
+
+async def test_periodic_sweep_self_heals_a_card_orphaned_by_a_crash(party_repos):
+    # Issue #66 restart-safety: a crash between the CANCELLED/EXPIRED
+    # transition committing and its card-deletion follow-up completing would
+    # otherwise leave a dead card behind forever. The periodic sweep finds
+    # and finishes that cleanup on its own, with no dedicated on-startup
+    # reconciliation needed.
+    from utils.lifecycle import LifecycleContext
+
+    party, *_ = party_repos
+    lobby = party.create(guild_id=1, organizer_id=1, capacity=4, operation_id="create-1")
+    party.set_delivery(
+        1, lobby.lobby_id, DiscordDelivery(panel_channel_id=600, panel_message_id=601),
+        operation_id="delivery",
+    )
+    party.transition(1, lobby.lobby_id, LobbyState.CANCELLED, operation_id="cancel-1")
+
+    card_message = MagicMock()
+    card_message.delete = AsyncMock()
+    public_channel = MagicMock(id=600)
+    public_channel.fetch_message = AsyncMock(return_value=card_message)
+    guild = _guild(1, channels={600: public_channel})
+    ctx = MagicMock(spec=LifecycleContext)
+    ctx.get_guild = lambda guild_id: guild if guild_id == 1 else None
+    ctx.get_channel = lambda channel_id: None
+
+    await bot.party_lobby_service.expire_ready_checks(ctx)
+
+    card_message.delete.assert_awaited_once()
+    changed_delivery = party.get(1, lobby.lobby_id).delivery
+    assert changed_delivery.panel_channel_id is None
+    assert changed_delivery.panel_message_id is None
+
+
+async def test_periodic_sweep_does_not_post_a_second_prompt_once_one_exists(
+    party_repos,
+):
+    party, *_ = party_repos
+    lobby = party.create(
+        guild_id=1, organizer_id=1, capacity=4, operation_id="create-1",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+    party.record_inactivity_prompt_sent(
+        1, lobby.lobby_id, 700, 800, operation_id="prompt-1",
+    )
+
+    due = party.due_for_inactivity_prompt(1)
+
+    assert due == []

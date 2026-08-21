@@ -160,7 +160,12 @@ def test_terminal_lobbies_are_not_returned_for_recovery(tmp_path):
     assert repo.audit_events(1, "lobby-0")[-1].metadata == {"reason": "test cleanup"}
 
 
-def test_recovery_expires_elapsed_recruitment_lobby(tmp_path):
+def test_recovery_does_not_hard_expire_a_lobby_awaiting_its_inactivity_prompt(tmp_path):
+    # Issue #66: an elapsed recruiting clock no longer expires the lobby
+    # directly — it needs a posted organizer confirmation prompt and an
+    # unanswered grace period first, which requires Discord access this
+    # store layer deliberately doesn't have. recover_active() must still
+    # return it as active.
     repo = repository(tmp_path)
     repo.create(
         guild_id=1,
@@ -171,12 +176,72 @@ def test_recovery_expires_elapsed_recruitment_lobby(tmp_path):
         operation_id="create",
     )
 
-    assert repo.recover_active(1) == []
-    expired = repo.get(1, "elapsed")
-    assert expired.state == LobbyState.EXPIRED
+    active = repo.recover_active(1)
+
+    assert len(active) == 1
+    assert active[0].lobby.state == LobbyState.OPEN
+    due = repo.due_for_inactivity_prompt(1)
+    assert [lobby.lobby_id for lobby in due] == ["elapsed"]
+
+
+def test_inactivity_prompt_sent_advances_the_grace_deadline(tmp_path):
+    repo = repository(tmp_path)
+    lobby = repo.create(
+        guild_id=1, organizer_id=2, capacity=5, lobby_id="elapsed",
+        expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+        operation_id="create",
+    )
+
+    updated = repo.record_inactivity_prompt_sent(
+        1, "elapsed", 600, 601, operation_id="prompt-1",
+    )
+
+    assert updated.delivery.inactivity_prompt_channel_id == 600
+    assert updated.delivery.inactivity_prompt_message_id == 601
+    assert updated.expires_at > lobby.expires_at
+    # Now that a prompt exists, the lobby is no longer due for a second one.
+    assert repo.due_for_inactivity_prompt(1) == []
+
+
+def test_unanswered_grace_period_auto_closes_the_lobby(tmp_path):
+    repo = repository(tmp_path)
+    repo.create(
+        guild_id=1, organizer_id=2, capacity=5, lobby_id="elapsed",
+        expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+        operation_id="create",
+    )
+    repo.record_inactivity_prompt_sent(
+        1, "elapsed", 600, 601, operation_id="prompt-1", grace_minutes=-1,
+    )
+
+    expired = repo.expire_due_recruitment(1)
+
+    assert [lobby.lobby_id for lobby in expired] == ["elapsed"]
+    closed = repo.get(1, "elapsed")
+    assert closed.state == LobbyState.EXPIRED
     event = repo.audit_events(1, "elapsed")[-1]
     assert event.event_type == "expired"
     assert event.metadata == {"reason": "expires_at elapsed"}
+
+
+def test_ready_check_lobbies_are_not_covered_by_recruiting_expiry(tmp_path):
+    # Issue #66 scope guardrail: READY_CHECK has its own fully separate
+    # ready-deadline timeout (PartyQueueService) and must never be swept by
+    # the recruiting-inactivity mechanism, even if a stale expires_at from
+    # its OPEN/FULL days is still sitting on the row.
+    repo = repository(tmp_path)
+    lobby = repo.create(
+        guild_id=1, organizer_id=2, capacity=5, lobby_id="in-ready-check",
+        expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+        operation_id="create",
+    )
+    repo.save_participant(1, lobby.lobby_id, Participant(2), operation_id="j1")
+    repo.transition(1, lobby.lobby_id, LobbyState.FULL, operation_id="full")
+    repo.transition(1, lobby.lobby_id, LobbyState.READY_CHECK, operation_id="ready")
+
+    assert repo.due_for_inactivity_prompt(1) == []
+    assert repo.expire_due_recruitment(1) == []
+    assert repo.get(1, lobby.lobby_id).state == LobbyState.READY_CHECK
 
 
 def test_recovery_does_not_expire_active_game(tmp_path):

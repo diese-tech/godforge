@@ -110,6 +110,7 @@ class PartyLobbyDeps:
     already_in_queue_view: Callable[..., discord.ui.View] | None = None
     rename_modal: Callable[..., discord.ui.Modal] | None = None
     start_queue_modal: Callable[..., discord.ui.Modal] | None = None
+    inactivity_prompt_view: Callable[[], discord.ui.View] | None = None
 
 
 class PartyLobbyService:
@@ -385,6 +386,155 @@ class PartyLobbyService:
             operation_id=f"public-lobby-delivery:{lobby.lobby_id}:{message.id}",
         )
         return updated, True
+
+    async def _delete_message_best_effort(self, guild, channel_id, message_id) -> None:
+        """Best-effort delete of a stored channel/message pair.
+
+        Shared by every Issue #66 cleanup path (terminal card deletion,
+        retiring a stale inactivity prompt): failing to delete a message
+        must never block or roll back the domain mutation that already
+        succeeded, matching the existing best-effort convention for
+        ``refresh_public_lobby_card``.
+        """
+        if guild is None or not channel_id or not message_id:
+            return
+        channel = guild.get_channel(channel_id)
+        if channel is None or not hasattr(channel, "fetch_message"):
+            return
+        try:
+            message = await channel.fetch_message(message_id)
+            await message.delete()
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException, AttributeError):
+            self.deps.log.exception("Could not delete a stale GodForge message")
+
+    async def delete_public_lobby_card(self, lobby, guild):
+        """Delete the canonical public queue card and retire its delivery ref.
+
+        Issue #66: a terminal recruiting closure (organizer cancel, the
+        inactivity grace period elapsing unanswered, a ready-check timeout
+        that cancels the lobby) must not leave a dead "Queue cancelled" /
+        "Queue expired" card cluttering the Play channel — unlike every
+        other public-card mutation, this one removes the message instead of
+        editing it. Best-effort like ``refresh_public_lobby_card``, but the
+        stored delivery ref is always cleared regardless of whether the
+        Discord delete itself succeeded, so a stale message ID is never
+        treated as if it were still live.
+        """
+        deps = self.deps
+        delivery = lobby.delivery
+        await self._delete_message_best_effort(
+            guild, delivery.panel_channel_id, delivery.panel_message_id
+        )
+        return deps.party_repository.set_delivery(
+            lobby.guild_id,
+            lobby.lobby_id,
+            replace(lobby.delivery, panel_channel_id=None, panel_message_id=None),
+            operation_id=f"public-lobby-card-deleted:{lobby.lobby_id}",
+        )
+
+    async def _touch_recruiting_activity(
+        self, guild_id, lobby_id, lobby, guild, *, operation_id
+    ):
+        """Reset the recruiting clock and retire any stale inactivity prompt.
+
+        Issue #66: every call site that already re-primes the 60-minute
+        recruiting clock on meaningful activity must also clean up an
+        in-flight grace-period prompt, since continued activity means the
+        organizer was never actually going to be asked. ``lobby`` must be
+        the caller's freshest known lobby state (read *before* this call),
+        so its delivery still names the prompt message to delete.
+        """
+        stale_channel_id = lobby.delivery.inactivity_prompt_channel_id
+        stale_message_id = lobby.delivery.inactivity_prompt_message_id
+        changed = self.deps.party_repository.touch_recruiting_activity(
+            guild_id, lobby_id, operation_id=operation_id,
+        )
+        if stale_message_id:
+            await self._delete_message_best_effort(guild, stale_channel_id, stale_message_id)
+        return changed
+
+    async def _post_inactivity_prompt(self, lobby, guild) -> None:
+        """Post the Issue #66 organizer confirmation prompt and start the grace period.
+
+        Best-effort: ``expires_at`` and the delivery refs only advance once
+        the message actually sends, so a failed post here is retried on the
+        next periodic sweep rather than silently losing the queue.
+        """
+        deps = self.deps
+        guild_settings = deps.settings_module.get_guild_settings(str(lobby.guild_id))
+        channel_id = guild_settings["managed"].get("playChannelId")
+        channel = guild.get_channel(int(channel_id)) if channel_id else None
+        if channel is None or not hasattr(channel, "send"):
+            return
+        embed = discord.Embed(
+            title="Still recruiting?",
+            description=(
+                f"**{lobby.display_title()}** has been quiet for a while. "
+                "Keep the queue open, or close it out?"
+            ),
+            color=0xF1C40F,
+        )
+        embed.set_footer(text=f"lobby_id={lobby.lobby_id}")
+        try:
+            message = await channel.send(
+                content=f"<@{lobby.organizer_id}>",
+                embed=embed,
+                view=deps.inactivity_prompt_view() if deps.inactivity_prompt_view else None,
+                allowed_mentions=discord.AllowedMentions(users=True, roles=False),
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            deps.log.exception(
+                "Could not post inactivity prompt for lobby %s", lobby.lobby_id
+            )
+            return
+        deps.party_repository.record_inactivity_prompt_sent(
+            lobby.guild_id, lobby.lobby_id, channel.id, message.id,
+            operation_id=f"inactivity-prompt:{lobby.lobby_id}:{message.id}",
+        )
+
+    async def handle_inactivity_prompt_action(
+        self, interaction: discord.Interaction, action: str
+    ) -> None:
+        """Organizer response to the Issue #66 "still recruiting?" prompt."""
+        deps = self.deps
+        guild_id = interaction.guild_id
+        if guild_id is None:
+            await interaction.response.send_message("Server-only action.", ephemeral=True)
+            return
+        lobby_id = self.lobby_id_from_interaction(interaction)
+        lobby = deps.party_repository.get(guild_id, lobby_id)
+        if lobby is None or lobby.state not in {LobbyState.OPEN, LobbyState.FULL}:
+            await interaction.response.send_message(
+                "That queue is no longer waiting on a response.", ephemeral=True,
+            )
+            return
+        if interaction.user.id != lobby.organizer_id:
+            await interaction.response.send_message(
+                "Only the organizer can respond to this prompt.", ephemeral=True,
+            )
+            return
+        if action == "keep_open":
+            await self._touch_recruiting_activity(
+                guild_id, lobby_id, lobby, interaction.guild,
+                operation_id=f"discord:{interaction.id}:keep-open",
+            )
+            await interaction.response.send_message("Queue kept open.", ephemeral=True)
+            return
+        if action == "close_queue":
+            changed = deps.party_repository.transition(
+                guild_id, lobby_id, LobbyState.CANCELLED,
+                operation_id=f"discord:{interaction.id}:close-inactive",
+                actor_id=interaction.user.id,
+            )
+            if interaction.guild is not None:
+                await self.delete_public_lobby_card(changed, interaction.guild)
+                await self._delete_message_best_effort(
+                    interaction.guild,
+                    lobby.delivery.inactivity_prompt_channel_id,
+                    lobby.delivery.inactivity_prompt_message_id,
+                )
+            await interaction.response.send_message("Queue closed.", ephemeral=True)
+            return
 
     async def ensure_ready_check_card(
         self, lobby, guild, queue, *, fallback_channel=None
@@ -966,8 +1116,9 @@ class PartyLobbyService:
         else:
             changed = lobby
         if changed.state in {LobbyState.OPEN, LobbyState.FULL}:
-            changed = deps.party_repository.touch_recruiting_activity(
-                guild_id, lobby_id, operation_id=f"discord:{interaction.id}:touch"
+            changed = await self._touch_recruiting_activity(
+                guild_id, lobby_id, changed, interaction.guild,
+                operation_id=f"discord:{interaction.id}:touch",
             )
 
         # The click may have come from an ephemeral join wizard (or the fast
@@ -1103,8 +1254,9 @@ class PartyLobbyService:
             operation_prefix=f"discord:{interaction.id}", actor_id=user_id,
         )
         if changed.state in {LobbyState.OPEN, LobbyState.FULL}:
-            changed = deps.party_repository.touch_recruiting_activity(
-                guild_id, lobby_id, operation_id=f"discord:{interaction.id}:touch"
+            changed = await self._touch_recruiting_activity(
+                guild_id, lobby_id, changed, interaction.guild,
+                operation_id=f"discord:{interaction.id}:touch",
             )
         if interaction.guild is not None:
             await self.refresh_public_lobby_card(changed, interaction.guild)
@@ -1169,8 +1321,8 @@ class PartyLobbyService:
                     await modal_interaction.response.send_message(str(exc), ephemeral=True)
                     return
                 if renamed.state in {LobbyState.OPEN, LobbyState.FULL}:
-                    renamed = deps.party_repository.touch_recruiting_activity(
-                        guild_id, lobby_id,
+                    renamed = await self._touch_recruiting_activity(
+                        guild_id, lobby_id, renamed, modal_interaction.guild,
                         operation_id=f"discord:{modal_interaction.id}:rename-touch",
                     )
                 if modal_interaction.guild is not None:
@@ -1407,7 +1559,12 @@ class PartyLobbyService:
                 operation_id=f"discord:{interaction.id}:cancel",
                 actor_id=interaction.user.id,
             )
-            await self.refresh_public_lobby_card(changed, interaction.guild)
+            await self.delete_public_lobby_card(changed, interaction.guild)
+            await self._delete_message_best_effort(
+                interaction.guild,
+                lobby.delivery.inactivity_prompt_channel_id,
+                lobby.delivery.inactivity_prompt_message_id,
+            )
             await interaction.response.send_message("Queue cancelled.", ephemeral=True)
             return
         if action == "edit":
@@ -1426,8 +1583,9 @@ class PartyLobbyService:
                     notes=str(payload.get("notes") or ""),
                 )
                 if changed.state in {LobbyState.OPEN, LobbyState.FULL}:
-                    changed = deps.party_repository.touch_recruiting_activity(
-                        guild_id, lobby_id, operation_id=f"discord:{edit_interaction.id}:touch"
+                    changed = await self._touch_recruiting_activity(
+                        guild_id, lobby_id, changed, edit_interaction.guild,
+                        operation_id=f"discord:{edit_interaction.id}:touch",
                     )
                 if edit_interaction.guild is not None:
                     await self.refresh_public_lobby_card(changed, edit_interaction.guild)
@@ -1846,8 +2004,9 @@ class PartyLobbyService:
                     operation_id=f"discord:{interaction.id}:reopen",
                 )
             if changed.state in {LobbyState.OPEN, LobbyState.FULL}:
-                changed = deps.party_repository.touch_recruiting_activity(
-                    guild_id, lobby_id, operation_id=f"discord:{interaction.id}:touch"
+                changed = await self._touch_recruiting_activity(
+                    guild_id, lobby_id, changed, interaction.guild,
+                    operation_id=f"discord:{interaction.id}:touch",
                 )
             if interaction.guild is not None:
                 await self.refresh_public_lobby_card(changed, interaction.guild)
@@ -1952,26 +2111,47 @@ class PartyLobbyService:
                 )
 
     async def expire_ready_checks(self, ctx: LifecycleContext) -> None:
-        """Time out ready checks whose deadline has passed.
+        """Time out ready checks and run the recruiting-inactivity sweep.
 
         A timed-out queue that has been cancelled also cancels its lobby; the
         organizer's play channel (if configured) is notified either way.
 
-        This pass also sweeps every guild's recruiting queues for the
-        60-minute inactivity expiry (Issue #63) and disables/relabels each
-        newly-expired queue's public card. ``recover_active()`` performs the
-        same state transition internally, but its own return value can never
-        include a lobby it just moved to the terminal EXPIRED state — so the
-        explicit ``expire_due_recruitment()`` call below is what a card
-        refresh has to key off of. Calling it here (as the periodic cleanup
-        hook) is also what keeps idle queues from expiring at all when no
-        further interaction ever triggers the sweep organically.
+        Issue #66 replaced silent hard expiry for OPEN/FULL queues with a
+        two-stage confirmation flow, both driven from this same periodic
+        pass (calling it here is what keeps an idle queue moving at all when
+        no further interaction ever triggers the sweep organically):
+
+        1. ``due_for_inactivity_prompt()`` finds queues that just went quiet
+           and posts the organizer confirmation prompt, which itself starts
+           a second 60-minute grace deadline (see
+           ``record_inactivity_prompt_sent``).
+        2. ``expire_due_recruitment()`` auto-closes queues whose grace period
+           elapsed with no response, deleting their public card.
+
+        ``recover_active()`` also calls ``expire_due_recruitment()`` as a
+        side effect, so a lobby it auto-closes there is unaffected by our
+        own separate call finding nothing — the card-deletion loop below is
+        the only place that ever acts on a newly-expired lobby.
+
+        Finally, ``terminal_lobbies_with_undeleted_card()`` is a self-healing
+        pass for the narrow crash window between a cancel/expiry transition
+        committing and its card-deletion follow-up completing — restart-safe
+        without needing any dedicated on-startup reconciliation.
         """
         deps = self.deps
+        for lobby in deps.party_repository.due_for_inactivity_prompt():
+            guild = ctx.get_guild(lobby.guild_id)
+            if guild is not None:
+                await self._post_inactivity_prompt(lobby, guild)
         for expired_lobby in deps.party_repository.expire_due_recruitment():
             guild = ctx.get_guild(expired_lobby.guild_id)
             if guild is not None:
-                await self.refresh_public_lobby_card(expired_lobby, guild)
+                await self.delete_public_lobby_card(expired_lobby, guild)
+                await self._delete_message_best_effort(
+                    guild,
+                    expired_lobby.delivery.inactivity_prompt_channel_id,
+                    expired_lobby.delivery.inactivity_prompt_message_id,
+                )
         for record in deps.party_repository.recover_active():
             lobby = record.lobby
             if lobby.state is not LobbyState.READY_CHECK:
@@ -1980,13 +2160,16 @@ class PartyLobbyService:
             if not timed_out:
                 continue
             if queue.status is QueueStatus.CANCELLED:
-                deps.party_repository.transition(
+                cancelled = deps.party_repository.transition(
                     lobby.guild_id,
                     lobby.lobby_id,
                     LobbyState.CANCELLED,
                     operation_id=f"ready-timeout:{lobby.lobby_id}:{queue.ready_deadline}",
                     reason="ready check timed out",
                 )
+                guild = ctx.get_guild(lobby.guild_id)
+                if guild is not None:
+                    await self.delete_public_lobby_card(cancelled, guild)
             guild_settings = deps.settings_module.get_guild_settings(str(lobby.guild_id))
             channel_id = guild_settings["managed"].get("playChannelId")
             channel = ctx.get_channel(int(channel_id)) if channel_id else None
@@ -1996,6 +2179,10 @@ class PartyLobbyService:
                     + " ".join(f"<@{user_id}>" for user_id in timed_out),
                     allowed_mentions=discord.AllowedMentions(users=True, roles=False),
                 )
+        for stray in deps.party_repository.terminal_lobbies_with_undeleted_card():
+            guild = ctx.get_guild(stray.guild_id)
+            if guild is not None:
+                await self.delete_public_lobby_card(stray, guild)
 
 
 class PartyLobbyFeature:

@@ -7,6 +7,7 @@ import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterator
@@ -394,6 +395,12 @@ class SQLitePartyRepository:
         not a fixed timer from creation. A no-op outside OPEN/FULL, since
         ready-check has its own deadline and later states don't expire this
         way.
+
+        Issue #66: also clears any in-flight inactivity-confirmation prompt.
+        Meaningful activity is itself the confirmation the queue is still
+        alive — the caller is responsible for best-effort deleting the now-
+        stale prompt message on Discord using the delivery refs from the
+        lobby it already had in hand *before* calling this.
         """
         fingerprint = f"touch:{guild_id}:{lobby_id}"
         with self._transaction() as conn:
@@ -403,9 +410,20 @@ class SQLitePartyRepository:
             if self._operation(conn, operation_id, fingerprint):
                 return self._require(conn, guild_id, lobby_id)
             new_expiry = utc_now() + timedelta(minutes=minutes)
+            cleared_delivery = replace(
+                lobby.delivery,
+                inactivity_prompt_channel_id=None,
+                inactivity_prompt_message_id=None,
+            )
             conn.execute(
-                "UPDATE party_lobbies SET expires_at=? WHERE lobby_id=? AND guild_id=?",
-                (_encode_time(new_expiry), lobby_id, guild_id),
+                "UPDATE party_lobbies SET expires_at=?,delivery_json=? "
+                "WHERE lobby_id=? AND guild_id=?",
+                (
+                    _encode_time(new_expiry),
+                    self._delivery_json(cleared_delivery),
+                    lobby_id,
+                    guild_id,
+                ),
             )
             changed = self._require(conn, guild_id, lobby_id)
             self._audit(
@@ -608,27 +626,104 @@ class SQLitePartyRepository:
                 for row in rows
             ]
 
-    def expire_due_recruitment(self, guild_id: int | None = None) -> list[PartyLobby]:
-        """Expire elapsed pre-active lobbies and return the ones just expired.
+    def due_for_inactivity_prompt(self, guild_id: int | None = None) -> list[PartyLobby]:
+        """OPEN/FULL lobbies whose recruiting clock elapsed with no prompt yet.
 
-        Issue #63: ``recover_active()`` calls this as a side effect and then
-        queries for non-terminal lobbies, which by construction can never
-        include a lobby this same call just moved to the terminal EXPIRED
-        state. Callers that need to *project* an expiry onto Discord (e.g.
-        disabling a stale public card) must use this return value directly
-        rather than trying to infer it from ``recover_active()``'s list.
+        Issue #66, stage 1: a queue that's gone quiet no longer expires
+        directly — it needs an organizer confirmation prompt and a second
+        grace period first. This is a read-only query; the caller (which
+        has the Discord access this store layer deliberately doesn't) posts
+        the prompt and then calls ``record_inactivity_prompt_sent`` to
+        durably advance the deadline, so a crash between the two just means
+        the next sweep tries again rather than silently losing the queue.
         """
-        expirable = (
-            LobbyState.OPEN,
-            LobbyState.FULL,
-            LobbyState.READY_CHECK,
+        query = (
+            "SELECT * FROM party_lobbies WHERE state IN (?,?) "
+            "AND expires_at IS NOT NULL AND expires_at<=? "
+            "AND json_extract(delivery_json,'$.inactivity_prompt_message_id') IS NULL"
         )
+        params: list[object] = [
+            LobbyState.OPEN.value, LobbyState.FULL.value, _encode_time(utc_now()),
+        ]
+        if guild_id is not None:
+            query += " AND guild_id=?"
+            params.append(guild_id)
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+            return [
+                self._require(conn, row["guild_id"], row["lobby_id"]) for row in rows
+            ]
+
+    def record_inactivity_prompt_sent(
+        self,
+        guild_id: int,
+        lobby_id: str,
+        channel_id: int,
+        message_id: int,
+        *,
+        operation_id: str,
+        grace_minutes: int = 60,
+    ) -> PartyLobby:
+        """Persist the posted confirmation prompt and start its grace deadline.
+
+        Reuses ``expires_at`` for the second-stage deadline rather than
+        adding a separate field — presence of the stored prompt message id
+        is what distinguishes "grace period" from "still on the ordinary
+        first-stage clock" everywhere else in this class.
+        """
+        fingerprint = f"inactivity-prompt:{guild_id}:{lobby_id}:{channel_id}:{message_id}"
+        with self._transaction() as conn:
+            if self._operation(conn, operation_id, fingerprint):
+                return self._require(conn, guild_id, lobby_id)
+            lobby = self._require(conn, guild_id, lobby_id)
+            new_delivery = replace(
+                lobby.delivery,
+                inactivity_prompt_channel_id=channel_id,
+                inactivity_prompt_message_id=message_id,
+            )
+            new_expiry = utc_now() + timedelta(minutes=grace_minutes)
+            conn.execute(
+                "UPDATE party_lobbies SET expires_at=?,delivery_json=? "
+                "WHERE lobby_id=? AND guild_id=?",
+                (
+                    _encode_time(new_expiry),
+                    self._delivery_json(new_delivery),
+                    lobby_id,
+                    guild_id,
+                ),
+            )
+            changed = self._require(conn, guild_id, lobby_id)
+            self._audit(
+                conn, changed, operation_id, fingerprint, "inactivity_prompt_sent",
+                lobby.state, None, {"channel_id": channel_id, "message_id": message_id},
+            )
+            return changed
+
+    def expire_due_recruitment(self, guild_id: int | None = None) -> list[PartyLobby]:
+        """Auto-close recruiting queues whose confirmation grace period elapsed.
+
+        Issue #66: this now only covers the *second* stage — a lobby that
+        already has a posted inactivity prompt (``due_for_inactivity_prompt``
+        handles posting that prompt and re-arming this same ``expires_at``
+        for the grace period, rather than expiring directly). READY_CHECK is
+        no longer covered here at all; it has its own fully separate
+        ready-deadline timeout via ``PartyQueueService``.
+
+        ``recover_active()`` calls this as a side effect and then queries for
+        non-terminal lobbies, which by construction can never include a
+        lobby this same call just moved to the terminal EXPIRED state.
+        Callers that need to *project* an expiry onto Discord (e.g. deleting
+        the now-dead public card) must use this return value directly rather
+        than trying to infer it from ``recover_active()``'s list.
+        """
+        expirable = (LobbyState.OPEN, LobbyState.FULL)
         placeholders = ",".join("?" for _ in expirable)
         params: list[object] = [state.value for state in expirable]
         query = (
             "SELECT lobby_id,guild_id,expires_at FROM party_lobbies "
             f"WHERE state IN ({placeholders}) AND expires_at IS NOT NULL "
-            "AND expires_at<=?"
+            "AND expires_at<=? "
+            "AND json_extract(delivery_json,'$.inactivity_prompt_message_id') IS NOT NULL"
         )
         params.append(_encode_time(utc_now()))
         if guild_id is not None:
@@ -672,6 +767,35 @@ class SQLitePartyRepository:
                 )
                 expired.append(changed)
         return expired
+
+    def terminal_lobbies_with_undeleted_card(
+        self, guild_id: int | None = None
+    ) -> list[PartyLobby]:
+        """Terminal lobbies whose public card delivery ref was never cleared.
+
+        Issue #66: cancelling/auto-closing a queue is two separate durable
+        writes — the state transition, then clearing the panel delivery ref
+        once the Discord message is actually deleted. A crash between the
+        two would otherwise leave a dead card behind forever with no way to
+        rediscover it. This is the self-healing query a periodic sweep uses
+        to find and finish that cleanup.
+        """
+        terminal = (LobbyState.CANCELLED, LobbyState.EXPIRED)
+        placeholders = ",".join("?" for _ in terminal)
+        params: list[object] = [state.value for state in terminal]
+        query = (
+            "SELECT * FROM party_lobbies WHERE state IN "
+            f"({placeholders}) AND "
+            "json_extract(delivery_json,'$.panel_message_id') IS NOT NULL"
+        )
+        if guild_id is not None:
+            query += " AND guild_id=?"
+            params.append(guild_id)
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+            return [
+                self._require(conn, row["guild_id"], row["lobby_id"]) for row in rows
+            ]
 
     def audit_events(self, guild_id: int, lobby_id: str) -> list[AuditEvent]:
         with self._connect() as conn:
@@ -837,6 +961,8 @@ class SQLitePartyRepository:
                 ready_channel_id=delivery.get("ready_channel_id"),
                 ready_message_id=delivery.get("ready_message_id"),
                 match_ready_notified=bool(delivery.get("match_ready_notified", False)),
+                inactivity_prompt_channel_id=delivery.get("inactivity_prompt_channel_id"),
+                inactivity_prompt_message_id=delivery.get("inactivity_prompt_message_id"),
             ),
             created_at=_decode_time(row["created_at"]),
             updated_at=_decode_time(row["updated_at"]),
@@ -863,6 +989,8 @@ class SQLitePartyRepository:
                 "ready_channel_id": delivery.ready_channel_id,
                 "ready_message_id": delivery.ready_message_id,
                 "match_ready_notified": delivery.match_ready_notified,
+                "inactivity_prompt_channel_id": delivery.inactivity_prompt_channel_id,
+                "inactivity_prompt_message_id": delivery.inactivity_prompt_message_id,
             },
             separators=(",", ":"), sort_keys=True,
         )

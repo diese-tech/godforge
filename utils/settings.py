@@ -38,7 +38,6 @@ MANAGED_ROLE_KEYS = (
     "solo",
     "captain",
     "substitute",
-    "region",
     "lfg",
 )
 _settings_lock = threading.RLock()

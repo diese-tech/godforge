@@ -82,7 +82,7 @@ Important status notes:
   channel and temporary-room category, publishes a persistent Play panel, and
   stores the returned Discord IDs per guild.
 - Setup creates permissionless Solo, Jungle, Mid, Support, and ADC cosmetic
-  roles. Captain, Substitute, Region, and LFG roles are optional command flags.
+  roles. Captain, Substitute, and LFG roles are optional command flags.
 - Re-running setup refreshes stored resources without duplication. Matching
   names are never silently adopted; conflicts produce a repair message.
 - The Play panel supports Start Queue, Find a Queue, and My Roles. Role

@@ -36,7 +36,6 @@ ROLE_PREFERENCES = (
     ("adc", "ADC", discord.ButtonStyle.secondary),
     ("captain", "Captain", discord.ButtonStyle.secondary),
     ("substitute", "Substitute", discord.ButtonStyle.secondary),
-    ("region", "Region", discord.ButtonStyle.secondary),
     ("lfg", "LFG", discord.ButtonStyle.secondary),
 )
 

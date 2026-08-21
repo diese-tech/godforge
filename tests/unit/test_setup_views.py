@@ -62,7 +62,6 @@ def test_role_preferences_are_persistent_with_stable_custom_ids():
         "ADC",
         "Captain",
         "Substitute",
-        "Region",
         "LFG",
     ]
 

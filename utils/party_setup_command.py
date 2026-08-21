@@ -199,7 +199,6 @@ def register_party_setup_command(
         test_mode="Use short-lived lobbies without recording match history",
         captain_role="Create an optional self-assignable captain role",
         substitute_role="Create an optional substitute role",
-        region_role="Create an optional region role",
         lfg_role="Create an optional LFG notification role",
     )
     async def setup(
@@ -207,7 +206,6 @@ def register_party_setup_command(
         test_mode: bool = False,
         captain_role: bool = False,
         substitute_role: bool = False,
-        region_role: bool = False,
         lfg_role: bool = False,
     ):
         if interaction.guild is None:
@@ -234,7 +232,6 @@ def register_party_setup_command(
                 for key, enabled in (
                     ("captain", captain_role),
                     ("substitute", substitute_role),
-                    ("region", region_role),
                     ("lfg", lfg_role),
                 )
                 if enabled

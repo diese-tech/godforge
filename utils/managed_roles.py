@@ -30,7 +30,6 @@ DEFAULT_ROLE_DEFINITIONS = (
 OPTIONAL_ROLE_DEFINITIONS = (
     ManagedRoleDefinition("captain", "GodForge • Captain", optional=True),
     ManagedRoleDefinition("substitute", "GodForge • Substitute", optional=True),
-    ManagedRoleDefinition("region", "GodForge • Region", optional=True),
     ManagedRoleDefinition("lfg", "GodForge • LFG", optional=True),
 )
 

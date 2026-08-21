@@ -94,29 +94,16 @@ async def test_play_panel_preferences_shows_current_roles(party_repos):
     assert "view" in kwargs
 
 
-async def test_play_panel_browse_empty_reports_none(party_repos):
-    interaction = _interaction()
-    await bot._handle_play_panel_action(interaction, "browse")
-    reply = interaction.response.send_message.call_args.args[0]
-    assert "No party lobbies" in reply
-
-
-async def test_play_panel_create_opens_selection_wizard(party_repos):
+async def test_play_panel_create_opens_start_queue_modal(party_repos):
+    # Issue #63 UX-cleanup: Start Queue asks only for an optional name via a
+    # modal — mode/region/format/etc. default and move to post-creation
+    # Queue Settings -> Edit Details.
     interaction = _interaction()
     await bot._handle_play_panel_action(interaction, "create")
-    interaction.response.send_modal.assert_not_awaited()
-    kwargs = interaction.response.send_message.await_args.kwargs
-    assert kwargs["ephemeral"] is True
-    assert kwargs["view"].children[0].custom_id == "godforge:lobby:create:mode:v2"
-
-
-async def test_play_panel_browse_shows_open_lobby(party_repos):
-    party, *_ = party_repos
-    party.create(guild_id=1, organizer_id=100, capacity=10, operation_id="create-1")
-    interaction = _interaction()
-    await bot._handle_play_panel_action(interaction, "browse")
-    kwargs = interaction.response.send_message.call_args.kwargs
-    assert "embed" in kwargs
+    interaction.response.send_message.assert_not_awaited()
+    interaction.response.send_modal.assert_awaited_once()
+    modal = interaction.response.send_modal.await_args.args[0]
+    assert modal.custom_id == "godforge:lobby:start-queue-modal:v1"
 
 
 # -- Create lobby + join -------------------------------------------------
@@ -221,22 +208,34 @@ async def test_lobby_card_cancel_by_organizer_transitions(party_repos):
     assert updated.state is LobbyState.CANCELLED
 
 
-async def test_lobby_card_share_persists_public_projection_reference(party_repos):
+async def test_lobby_card_repost_persists_public_projection_reference(
+    party_repos, tmp_settings
+):
+    # Issue #63: "Share" is now an organizer-only recovery action ("Repost
+    # Queue") that publishes to the *configured* GodForge Play channel
+    # (never the channel the button happened to be clicked from).
+    import utils.settings as settings_mod
+
     party, *_ = party_repos
     lobby = party.create(guild_id=1, organizer_id=100, capacity=4, operation_id="create-1")
-    channel = MagicMock(id=600)
-    channel.send = AsyncMock(return_value=MagicMock(id=601))
+    settings_mod.update_guild_settings("1", {"managed": {"playChannelId": "600"}})
+    play_channel = MagicMock(id=600)
+    play_channel.send = AsyncMock(return_value=MagicMock(id=601))
+    guild = _guild(1)
+    guild.get_channel = lambda channel_id: play_channel if channel_id == 600 else None
     interaction = _interaction(
         user_id=100,
-        channel=channel,
+        guild=guild,
         message=_lobby_footer_message(lobby.lobby_id),
     )
 
-    await bot._handle_lobby_card_action(interaction, "share")
+    await bot._handle_lobby_card_action(interaction, "repost")
 
     delivery = party.get(1, lobby.lobby_id).delivery
     assert delivery.panel_channel_id == 600
-    assert delivery.panel_message_id == 12345
+    assert delivery.panel_message_id == 601
+    reply = interaction.response.send_message.await_args.args[0]
+    assert "reposted" in reply.lower()
 
 
 async def test_lobby_card_ready_check_requires_organizer(party_repos):
@@ -283,6 +282,7 @@ async def test_ready_check_all_ready_transitions_to_forming(party_repos, monkeyp
     public_message.edit = AsyncMock()
     public_channel = MagicMock()
     public_channel.fetch_message = AsyncMock(return_value=public_message)
+    public_channel.send = AsyncMock(return_value=MagicMock(id=888))
     guild = _guild(1)
     guild.get_channel = lambda channel_id: (
         private_channel if channel_id == 555 else public_channel if channel_id == 600 else None
@@ -313,6 +313,13 @@ async def test_ready_check_all_ready_transitions_to_forming(party_repos, monkeyp
         field.name == "Status" and "Match forming" in field.value
         for field in public_embed.fields
     )
+    # Issue #63: one roster ping, in-server, with a real clickable channel
+    # mention to the newly provisioned private match room.
+    public_channel.send.assert_awaited_once()
+    ping = public_channel.send.await_args.kwargs["content"]
+    assert "<@1>" in ping and "<@2>" in ping
+    assert "<#555>" in ping
+    assert party.get(1, lobby.lobby_id).delivery.match_ready_notified is True
 
 
 async def test_ready_check_drop_reopens_lobby(party_repos):

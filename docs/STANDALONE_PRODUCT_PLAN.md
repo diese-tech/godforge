@@ -1,12 +1,16 @@
 # GodForge Standalone Product Plan
 
-Status: implementation complete; live validation pending (`v2.3.0-rc.2`)
-Last updated: July 20, 2026
+Status: implementation complete; live validation pending (`v2.3.0-rc.3`)
+Last updated: August 20, 2026
 
 ## Implementation tracker
 
 All linked implementation issues are merged. This tracker remains as the
-durable map from product intent to repository history.
+durable map from product intent to repository history. The Phase 1 party
+lobby section below is kept for historical/directional context; for the
+*current* Play panel workflow and lifecycle rules, see
+[`PARTY_QUEUE_UX.md`](PARTY_QUEUE_UX.md), which Phase 1's queue-first
+hardening pass superseded some details of.
 
 - Foundation: [#18](https://github.com/diese-tech/lab-godforge/issues/18)
   durable lobby lifecycle and
@@ -22,6 +26,11 @@ durable map from product intent to repository history.
 - Game-night expansion:
   [#28](https://github.com/diese-tech/lab-godforge/issues/28) scheduling and
   [#29](https://github.com/diese-tech/lab-godforge/issues/29) team/scrim tools.
+- Queue-first UX hardening:
+  [#63](https://github.com/diese-tech/lab-godforge/issues/63) fixed a
+  join/public-card desync bug and reworked the Play panel around a
+  streamlined, multi-queue-safe workflow. See
+  [`PARTY_QUEUE_UX.md`](PARTY_QUEUE_UX.md) for current behavior.
 
 ## Product direction
 
@@ -181,7 +190,10 @@ Exit criteria:
 
 ### Phase 1: Party Lobby MVP
 
-This is the highest-priority market feature.
+This is the highest-priority market feature. **Historical design intent —**
+**the panel buttons, creation modal fields, and card button list below were**
+**superseded by the Issue #63 queue-first hardening pass. For current**
+**behavior, see [`PARTY_QUEUE_UX.md`](PARTY_QUEUE_UX.md).**
 
 #### Persistent Play SMITE panel
 

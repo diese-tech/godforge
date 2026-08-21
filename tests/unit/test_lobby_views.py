@@ -14,6 +14,7 @@ from utils.lobby_views import (
     MatchFormationView,
     MatchResultView,
     ReadyCheckView,
+    _ValidationError,
 )
 
 
@@ -44,13 +45,14 @@ def test_create_wizard_uses_only_constrained_controls_for_configuration():
 
 
 def test_join_wizard_exposes_role_and_boolean_selections_without_text_inputs():
+    # Issue #63: captain willingness is no longer collected during a normal
+    # queue join — only Primary role, Secondary role, and Fill.
     view = JoinPreferencesView(AsyncMock())
 
     assert [item.custom_id for item in view.children] == [
         "godforge:lobby:join:primary:v2",
         "godforge:lobby:join:secondary:v2",
         "godforge:lobby:join:fill:v2",
-        "godforge:lobby:join:captain:v2",
         "godforge:lobby:join:confirm:v2",
         "godforge:lobby:join:cancel:v2",
     ]
@@ -84,6 +86,7 @@ async def test_create_wizard_delegates_a_complete_constrained_payload_once():
             "voice_required": True,
             "skill_band": "intermediate",
             "notes": "chill games",
+            "queue_name": "Late Night Inhouses",
         },
     )
     interaction = _interaction()
@@ -100,6 +103,7 @@ async def test_create_wizard_delegates_a_complete_constrained_payload_once():
             "voice_required": True,
             "skill_band": "intermediate",
             "notes": "chill games",
+            "queue_name": "Late Night Inhouses",
         },
     )
 
@@ -113,22 +117,69 @@ async def test_join_wizard_rejects_duplicate_roles_and_cancel_is_safe():
             "primary_role": "mid",
             "secondary_role": "mid",
             "fill": False,
-            "captain": False,
         },
     )
     interaction = _interaction()
 
-    await view.children[4].callback(interaction)
+    await view.children[3].callback(interaction)
 
     handler.assert_not_awaited()
     assert "must be different" in interaction.response.send_message.await_args.args[0]
 
     cancelled = JoinPreferencesView(handler)
     cancel_interaction = _interaction()
-    await cancelled.children[5].callback(cancel_interaction)
+    await cancelled.children[4].callback(cancel_interaction)
     cancel_interaction.response.edit_message.assert_awaited_once_with(
-        content="Lobby join cancelled.", view=None
+        content="Queue join cancelled.", view=None
     )
+
+
+async def test_join_wizard_secondary_role_defaults_to_none_without_selection():
+    # Issue #63 follow-up: Secondary role is described as optional, so Join
+    # must succeed without the player ever touching that select — not just
+    # without picking a specific role from it.
+    view = JoinPreferencesView(AsyncMock())
+
+    assert view.state["secondary_role"] is None
+    secondary_select = next(
+        item for item in view.children
+        if getattr(item, "custom_id", "") == "godforge:lobby:join:secondary:v2"
+    )
+    assert next(o for o in secondary_select.options if o.default).value == "none"
+
+
+async def test_join_wizard_requires_only_primary_role_and_fill():
+    handler = AsyncMock()
+    view = JoinPreferencesView(handler)
+    interaction = _interaction()
+
+    # Primary role missing entirely -> rejected.
+    with pytest.raises(_ValidationError):
+        await view.act(interaction, "confirm")
+    handler.assert_not_awaited()
+
+    # Primary role set, Fill still missing -> rejected.
+    view.state["primary_role"] = "mid"
+    with pytest.raises(_ValidationError):
+        await view.act(interaction, "confirm")
+    handler.assert_not_awaited()
+
+    # Primary + Fill set, Secondary never touched -> succeeds using the
+    # default None.
+    view.state["fill"] = False
+    await view.act(interaction, "confirm")
+    handler.assert_awaited_once_with(
+        interaction, {"primary_role": "mid", "secondary_role": None, "fill": False}
+    )
+
+
+async def test_join_wizard_secondary_role_still_selectable():
+    view = JoinPreferencesView(AsyncMock())
+    interaction = _interaction()
+
+    await view.select(interaction, "secondary_role", "support")
+
+    assert view.state["secondary_role"] == "support"
 
 
 def test_lobby_card_is_persistent_with_stable_action_ids():

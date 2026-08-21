@@ -1,15 +1,16 @@
-"""Play panel, lobby card, queue, ready-check, and draft-launch orchestration.
+"""Play panel, queue card, ready-check, and draft-launch orchestration.
 
-Feature module for the Issue #48 refactor. This is the largest and most
-tightly-coupled surface migrated out of ``bot.py``: the Play-panel button
-handler, lobby creation/join flows, the party-queue bootstrap helper, the
-lobby-card button handler, the ready-check button handler, and launching the
-draft engine (local or activity backend) from a formed lobby.
+Feature module for the Issue #48 refactor, hardened for the Issue #63
+queue-first UX pass. This is the largest and most tightly-coupled surface
+migrated out of ``bot.py``: the Play-panel button handler, queue
+creation/join flows, the party-queue bootstrap helper, the queue-card button
+handler, the ready-check button handler, and launching the draft engine
+(local or activity backend) from a formed lobby.
 
 Unlike the smaller command features extracted earlier, these handlers already
 call each other directly and share a wide set of collaborators — that
-coupling is inherent to the feature (a lobby card action can trigger a ready
-check, which can trigger room provisioning; joining can fill a lobby and
+coupling is inherent to the feature (a queue-card action can trigger a ready
+check, which can trigger room provisioning; joining can fill a queue and
 trigger a ready check; launching a draft reconciles the lobby and posts a
 match-result card). ``PartyLobbyService`` makes that coupling explicit and
 testable via one injected ``PartyLobbyDeps`` rather than scattered ``bot.py``
@@ -20,10 +21,22 @@ work noted in the architecture roadmap.
 Discord objects stay at this boundary; domain logic stays in
 ``utils/party.py``, ``utils/party_store.py``, ``utils/party_queue.py``,
 ``utils/party_draft.py``, and ``utils/team_formation.py``.
+
+Issue #63 hardening rule that shapes most of this file: a Discord
+interaction's own message (``interaction.message``) is *never* assumed to be
+the canonical public queue card. The canonical card's location is whatever
+is durably stored on ``lobby.delivery`` (``panel_channel_id`` /
+``panel_message_id``); every mutation refreshes that stored message instead
+of editing whatever message happened to trigger the interaction. The one
+exception is a component click that lives directly on a persistent card
+(e.g. clicking Ready on the ready-check message) — there, editing
+``interaction.message`` *is* editing the right message, because Discord
+guarantees the interaction's message is the exact component's own message.
 """
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Callable
@@ -35,6 +48,19 @@ from utils.party import LobbyState, Participant, PlayerPreferences
 from utils.party_draft import PartyDraftError
 from utils.party_queue import QueueError, QueueStatus, ReadyStatus
 from utils.team_formation import FormationMode
+
+
+# Issue #63 UX-cleanup pass: Start Queue's default path no longer collects
+# mode/region/format/capacity/voice/skill up front — these sensible defaults
+# are used instead, and stay fully editable afterward via Queue Settings ->
+# Edit Details rather than being required every time a queue is started.
+DEFAULT_QUEUE_CAPACITY = 10
+DEFAULT_QUEUE_MODE = "conquest"
+DEFAULT_QUEUE_FORMAT = "5v5"
+
+# The public card shows a compact per-player role preview, not a full roster
+# dump — cap how many rows it lists before collapsing the rest into "+N".
+ROSTER_PREVIEW_LIMIT = 6
 
 
 @dataclass
@@ -73,27 +99,82 @@ class PartyLobbyDeps:
     match_result_view: Callable[[], discord.ui.View]
     match_formation_view: Callable[[], discord.ui.View] | None = None
 
+    # Issue #63 additions. All follow the same "inject a small factory"
+    # convention as the fields above so PartyLobbyService stays Discord-UI
+    # agnostic and test-friendly.
+    recruiting_card_view: Callable[[], discord.ui.View] | None = None
+    queue_settings_view: Callable[[], discord.ui.View] | None = None
+    transfer_organizer_view: Callable[..., discord.ui.View] | None = None
+    queue_select_view: Callable[..., discord.ui.View] | None = None
+    change_roles_view: Callable[..., discord.ui.View] | None = None
+    already_in_queue_view: Callable[..., discord.ui.View] | None = None
+    rename_modal: Callable[..., discord.ui.Modal] | None = None
+    start_queue_modal: Callable[..., discord.ui.Modal] | None = None
+
 
 class PartyLobbyService:
     def __init__(self, deps: PartyLobbyDeps) -> None:
         self.deps = deps
+        # Serializes the "everyone just became ready" handoff per lobby so a
+        # double-clicked or retried final Ready response can never provision
+        # two rooms or send two match-ready pings for the same queue.
+        self._handoff_locks: dict[str, asyncio.Lock] = {}
+        self._handoff_locks_guard = asyncio.Lock()
 
     # -- Rendering --------------------------------------------------------
 
-    def lobby_card_embed(self, lobby) -> discord.Embed:
-        participants = (
-            ", ".join(f"<@{p.user_id}>" for p in lobby.participants) or "None"
-        )
+    @staticmethod
+    def _participant_role_summary(participant, guild: discord.Guild | None = None) -> str:
+        """One compact roster line: display name (or mention) · role context.
+
+        Issue #63 follow-up: the public card should give players enough
+        SMITE-specific context to decide whether to join, without becoming
+        an analytics panel — so this is a single short line per player, not
+        a breakdown of every saved preference.
+        """
+        member = guild.get_member(participant.user_id) if guild is not None else None
+        label = member.display_name if member is not None else f"<@{participant.user_id}>"
+        roles = [
+            role.title()
+            for role in (participant.primary_role, participant.secondary_role)
+            if role
+        ]
+        if roles:
+            role_text = " / ".join(roles)
+            if participant.fill:
+                role_text += " (Fill)"
+        else:
+            role_text = "Fill" if participant.fill else "No role set"
+        return f"{label} · {role_text}"
+
+    def lobby_card_embed(
+        self, lobby, guild: discord.Guild | None = None
+    ) -> discord.Embed:
+        owner_name = None
+        if guild is not None:
+            member = guild.get_member(lobby.organizer_id)
+            owner_name = member.display_name if member else None
         embed = discord.Embed(
-            title=f"{lobby.mode.title()} · {lobby.region.upper() or 'Any region'}",
-            description=lobby.notes or "Reusable GodForge party lobby",
+            title=lobby.display_title(owner_name),
+            description=lobby.notes or "Reusable GodForge party queue",
             color=0x3498DB,
         )
+        queue_line = f"`{lobby.queue_code}` · {lobby.mode.title()}"
+        if lobby.region:
+            queue_line += f" · {lobby.region.upper()}"
+        embed.add_field(name="Queue", value=queue_line, inline=False)
         embed.add_field(name="Organizer", value=f"<@{lobby.organizer_id}>")
         embed.add_field(name="Format", value=lobby.format)
+        roster_lines = [
+            self._participant_role_summary(participant, guild)
+            for participant in lobby.participants[:ROSTER_PREVIEW_LIMIT]
+        ]
+        remaining = len(lobby.participants) - len(roster_lines)
+        if remaining > 0:
+            roster_lines.append(f"+{remaining} other{'s' if remaining != 1 else ''}")
         embed.add_field(
-            name="Roster",
-            value=f"{len(lobby.participants)}/{lobby.capacity} · {participants}",
+            name=f"Roster · {len(lobby.participants)}/{lobby.capacity}",
+            value="\n".join(roster_lines) or "No one has joined yet.",
             inline=False,
         )
         embed.add_field(
@@ -105,20 +186,21 @@ class PartyLobbyService:
             inline=False,
         )
         if lobby.state is LobbyState.FORMING:
-            embed.add_field(
-                name="Status",
-                value=(
-                    f"Match forming · {len(lobby.participants)}/{lobby.capacity} ready · "
-                    "Private room created"
-                ),
-                inline=False,
-            )
+            value = f"Match forming · {len(lobby.participants)}/{lobby.capacity} ready"
+            if lobby.delivery.match_channel_id:
+                value += f" · Continue in <#{lobby.delivery.match_channel_id}>"
+            embed.add_field(name="Status", value=value, inline=False)
         elif lobby.state is LobbyState.ACTIVE:
+            value = "Match active · Draft and results are in the private room"
+            if lobby.delivery.match_channel_id:
+                value += f" · <#{lobby.delivery.match_channel_id}>"
+            embed.add_field(name="Status", value=value, inline=False)
+        elif lobby.state is LobbyState.EXPIRED:
             embed.add_field(
-                name="Status",
-                value="Match active · Draft and results are in the private room",
-                inline=False,
+                name="Status", value="Queue expired from inactivity.", inline=False
             )
+        elif lobby.state is LobbyState.CANCELLED:
+            embed.add_field(name="Status", value="Queue cancelled.", inline=False)
         embed.set_footer(text=f"lobby_id={lobby.lobby_id}")
         return embed
 
@@ -132,6 +214,19 @@ class PartyLobbyService:
             ),
             color=0xF1C40F,
         )
+        # Issue #63: name exactly who is still blocking progress instead of
+        # only showing a count, so the group knows who to nudge.
+        outstanding = []
+        for member in queue.active:
+            status = queue.ready.get(member.user_id)
+            if status is ReadyStatus.READY:
+                continue
+            label = f"<@{member.user_id}>"
+            if status is ReadyStatus.NEED_5:
+                label += " · needs 5 minutes"
+            outstanding.append(label)
+        if outstanding:
+            embed.add_field(name="Waiting on", value="\n".join(outstanding), inline=False)
         if queue.ready_deadline:
             embed.add_field(
                 name="Deadline",
@@ -221,7 +316,18 @@ class PartyLobbyService:
         )
 
     async def refresh_public_lobby_card(self, lobby, guild) -> None:
-        """Best-effort refresh of the shared public status projection."""
+        """Best-effort refresh of the shared public status projection.
+
+        This is the *only* mechanism that should update the canonical public
+        queue card. It always resolves the card through the durable
+        ``lobby.delivery`` reference — never through whichever Discord
+        interaction happened to trigger the mutation — so an ephemeral join
+        wizard, a settings panel, or a completely different queue's card can
+        never be mistaken for this queue's public projection.
+
+        Best-effort by design: a failed Discord edit here must never roll
+        back the domain mutation that already succeeded.
+        """
         delivery = lobby.delivery
         if not delivery.panel_channel_id or not delivery.panel_message_id:
             return
@@ -232,16 +338,118 @@ class PartyLobbyService:
             message = await channel.fetch_message(delivery.panel_message_id)
             recruiting = lobby.state in {LobbyState.OPEN, LobbyState.FULL}
             await message.edit(
-                embed=self.lobby_card_embed(lobby),
-                view=self.deps.lobby_card_view() if recruiting else None,
+                embed=self.lobby_card_embed(lobby, guild),
+                view=self.deps.recruiting_card_view() if recruiting else None,
             )
         except (discord.NotFound, discord.Forbidden, discord.HTTPException, AttributeError):
             self.deps.log.exception(
                 "Could not refresh public lobby card %s", lobby.lobby_id
             )
 
+    async def ensure_public_lobby_card(self, lobby, guild) -> tuple[object, bool]:
+        """Refresh the public card if it exists, else publish it fresh.
+
+        Issue #63: queue creation must auto-publish (no more manual Share
+        step), and a deleted/missing card must have a recoverable repost
+        path. Both are the same operation — this is that operation. Returns
+        ``(lobby, True)`` when a new message was posted, ``(lobby, False)``
+        otherwise (already live and refreshed, or no Play channel configured
+        yet).
+        """
+        deps = self.deps
+        delivery = lobby.delivery
+        if delivery.panel_channel_id and delivery.panel_message_id:
+            channel = guild.get_channel(delivery.panel_channel_id)
+            if channel is not None and hasattr(channel, "fetch_message"):
+                try:
+                    await channel.fetch_message(delivery.panel_message_id)
+                    await self.refresh_public_lobby_card(lobby, guild)
+                    return lobby, False
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException,
+                        AttributeError):
+                    pass  # Stored message is gone; fall through and repost.
+        guild_settings = deps.settings_module.get_guild_settings(str(lobby.guild_id))
+        channel_id = guild_settings["managed"].get("playChannelId")
+        channel = guild.get_channel(int(channel_id)) if channel_id else None
+        if channel is None or not hasattr(channel, "send"):
+            return lobby, False
+        recruiting = lobby.state in {LobbyState.OPEN, LobbyState.FULL}
+        message = await channel.send(
+            embed=self.lobby_card_embed(lobby, guild),
+            view=deps.recruiting_card_view() if recruiting else None,
+        )
+        updated = deps.party_repository.set_delivery(
+            lobby.guild_id,
+            lobby.lobby_id,
+            replace(lobby.delivery, panel_channel_id=channel.id, panel_message_id=message.id),
+            operation_id=f"public-lobby-delivery:{lobby.lobby_id}:{message.id}",
+        )
+        return updated, True
+
+    async def ensure_ready_check_card(
+        self, lobby, guild, queue, *, fallback_channel=None
+    ):
+        """Create or refresh the one durable ready-check message for a queue.
+
+        Storing its channel/message IDs (mirroring how the formation card
+        already works) means a retried "queue just filled" event, an
+        organizer manually restarting a ready check, and restart recovery
+        all edit the same message instead of posting duplicates.
+
+        Issue #63 follow-up: a ready check *starting* must not itself send a
+        notification ping — the only roster ping in the whole flow is the
+        one-time match-ready handoff (``_send_match_ready_handoff``). The
+        outstanding players are still shown as mentions, but inside the
+        embed's "Waiting on" field; embed mentions render as clickable
+        without notifying anyone, unlike a mention in the message content.
+        """
+        deps = self.deps
+        delivery = lobby.delivery
+        if delivery.ready_channel_id and delivery.ready_message_id:
+            channel = guild.get_channel(delivery.ready_channel_id)
+            if channel is not None and hasattr(channel, "fetch_message"):
+                try:
+                    message = await channel.fetch_message(delivery.ready_message_id)
+                    await message.edit(
+                        embed=self.ready_check_embed(lobby.lobby_id, queue),
+                        view=deps.ready_check_view(),
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    return lobby
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException,
+                        AttributeError):
+                    pass  # Stored message is gone; post a fresh one below.
+        channel = None
+        if delivery.panel_channel_id:
+            channel = guild.get_channel(delivery.panel_channel_id)
+        if channel is None or not hasattr(channel, "send"):
+            channel = fallback_channel
+        if channel is None or not hasattr(channel, "send"):
+            return lobby
+        message = await channel.send(
+            embed=self.ready_check_embed(lobby.lobby_id, queue),
+            view=deps.ready_check_view(),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        channel_id = getattr(channel, "id", None)
+        if channel_id is None:
+            return lobby
+        return deps.party_repository.set_delivery(
+            lobby.guild_id,
+            lobby.lobby_id,
+            replace(lobby.delivery, ready_channel_id=channel_id, ready_message_id=message.id),
+            operation_id=f"ready-delivery:{lobby.lobby_id}:{message.id}",
+        )
+
     @staticmethod
     def lobby_id_from_interaction(interaction: discord.Interaction) -> str:
+        """Read the lobby_id stamped in an embed footer.
+
+        This is an identity lookup only — safe to use against *any* message
+        that carries the footer (a public card, a ready-check card, or even
+        an ephemeral settings panel we stamped ourselves), unlike editing
+        ``interaction.message`` to represent live queue state.
+        """
         embeds = getattr(interaction.message, "embeds", ())
         footer = embeds[0].footer.text if embeds and embeds[0].footer else ""
         if not footer.startswith("lobby_id="):
@@ -319,59 +527,56 @@ class PartyLobbyService:
             for record in deps.party_repository.recover_active(guild_id)
             if record.lobby.state in {LobbyState.OPEN, LobbyState.FULL}
         ]
-        if action == "browse":
-            if not active:
-                await interaction.response.send_message(
-                    "No party lobbies are open yet.",
-                    ephemeral=True,
-                )
-                return
-            lobby = active[0]
-            await interaction.response.send_message(
-                embed=self.lobby_card_embed(lobby),
-                view=deps.lobby_card_view(),
-                ephemeral=True,
-            )
-            for additional_lobby in active[1:]:
-                await interaction.followup.send(
-                    embed=self.lobby_card_embed(additional_lobby),
-                    view=deps.lobby_card_view(),
-                    ephemeral=True,
-                )
-            return
         if action == "create":
-            view = deps.create_lobby_view(self.handle_create_lobby_submission)
-            await interaction.response.send_message(
-                embed=view.summary_embed(), view=view, ephemeral=True
-            )
+            await self.start_queue_flow(interaction)
             return
         if action == "queue":
-            lobby = next(
-                (
-                    candidate
-                    for candidate in active
-                    if candidate.state is LobbyState.OPEN
-                    and len(candidate.participants) < candidate.capacity
-                ),
-                None,
-            )
-            if lobby is None:
+            # Issue #63: this used to route to the first open lobby with
+            # space, which is unsafe once a guild runs multiple queues at
+            # once. Joinable queues are only ever auto-selected when there is
+            # exactly one; otherwise the player must choose explicitly.
+            joinable = [
+                candidate
+                for candidate in active
+                if candidate.state is LobbyState.OPEN
+                and len(candidate.participants) < candidate.capacity
+            ]
+            if not joinable:
                 await interaction.response.send_message(
-                    "No open lobby has space. Create one instead.",
+                    "No open queue has space right now. Start one instead.",
                     ephemeral=True,
                 )
                 return
+            if len(joinable) == 1:
+                await self.start_join_flow(interaction, joinable[0])
+                return
 
-            async def join_handler(join_interaction, payload):
-                await self.join_lobby_from_preferences(
-                    join_interaction,
-                    lobby.lobby_id,
-                    payload,
+            options: list[tuple[str, str]] = []
+            for candidate in joinable:
+                member = interaction.guild.get_member(candidate.organizer_id)
+                name = candidate.display_title(member.display_name if member else None)
+                options.append(
+                    (
+                        candidate.lobby_id,
+                        f"{name} · {candidate.queue_code} · "
+                        f"{len(candidate.participants)}/{candidate.capacity}",
+                    )
                 )
 
+            async def select_handler(
+                select_interaction: discord.Interaction, chosen_lobby_id: str
+            ) -> None:
+                chosen = deps.party_repository.get(guild_id, chosen_lobby_id)
+                if chosen is None:
+                    await select_interaction.response.send_message(
+                        "That queue is no longer open.", ephemeral=True
+                    )
+                    return
+                await self.start_join_flow(select_interaction, chosen)
+
             await interaction.response.send_message(
-                "Choose your lobby role preferences.",
-                view=deps.join_preferences_view(join_handler),
+                "Multiple queues are open. Choose one to join.",
+                view=deps.queue_select_view(select_handler, options),
                 ephemeral=True,
             )
 
@@ -417,6 +622,79 @@ class PartyLobbyService:
             ephemeral=True,
         )
 
+    async def start_queue_flow(self, interaction: discord.Interaction) -> None:
+        """The default Start Queue path: optional name, then Start.
+
+        Issue #63 UX-cleanup: queue configuration (mode/region/format/
+        capacity/voice/skill) no longer gates creation — it defaults
+        sensibly and is only ever tuned afterward via Queue Settings ->
+        Edit Details. The organizer still needs a usable SMITE role profile
+        (they're seated as the queue's first participant), so a first-time
+        organizer completes the same lightweight role picker a joining
+        player would; a returning organizer with saved roles skips straight
+        to Start.
+        """
+        deps = self.deps
+        guild_id = interaction.guild_id
+        if guild_id is None:
+            await interaction.response.send_message("Server-only action.", ephemeral=True)
+            return
+        existing_other = await self.find_active_queue_for_player(
+            guild_id, interaction.user.id
+        )
+        if existing_other is not None:
+            await self._reject_double_booking(interaction, existing_other)
+            return
+
+        async def name_submitted(modal_interaction: discord.Interaction, queue_name: str) -> None:
+            await self._start_queue_after_name(modal_interaction, queue_name)
+
+        await interaction.response.send_modal(deps.start_queue_modal(name_submitted))
+
+    async def _start_queue_after_name(
+        self, interaction: discord.Interaction, queue_name: str
+    ) -> None:
+        deps = self.deps
+        guild_id = interaction.guild_id
+        if guild_id is None:
+            await interaction.response.send_message("Server-only action.", ephemeral=True)
+            return
+        saved = deps.party_repository.get_player_preferences(guild_id, interaction.user.id)
+        default_payload = {
+            "mode": DEFAULT_QUEUE_MODE,
+            "region": "",
+            "format": DEFAULT_QUEUE_FORMAT,
+            "party_size": DEFAULT_QUEUE_CAPACITY,
+            "voice_required": False,
+            "skill_band": "",
+            "notes": "",
+            "queue_name": queue_name,
+        }
+        if saved.primary_role:
+            await self.handle_create_lobby_submission(interaction, default_payload)
+            return
+
+        # First-time organizer: the same lightweight Primary/Secondary/Fill
+        # picker a joining player sees, since they're about to become this
+        # queue's first participant.
+        async def role_handler(role_interaction: discord.Interaction, payload) -> None:
+            profile = PlayerPreferences(
+                str(payload["primary_role"]),
+                str(payload.get("secondary_role") or "") or None,
+                bool(payload["fill"]),
+                saved.captain,
+            )
+            deps.party_repository.set_player_preferences(
+                guild_id, role_interaction.user.id, profile
+            )
+            await self.handle_create_lobby_submission(role_interaction, default_payload)
+
+        await interaction.response.send_message(
+            "Choose your role preferences to start this queue.",
+            view=deps.join_preferences_view(role_handler),
+            ephemeral=True,
+        )
+
     async def handle_create_lobby_submission(
         self, interaction: discord.Interaction, payload: dict[str, object]
     ) -> None:
@@ -432,6 +710,17 @@ class PartyLobbyService:
                 ephemeral=True,
             )
             return
+        # Issue #63 locked-in edge case: starting a *new* queue seats the
+        # organizer as its first participant, so the one-active-queue-per-
+        # player guard applies here too — otherwise an organizer already
+        # committed elsewhere could spin up (and get double-booked into) a
+        # second queue.
+        existing_other = await self.find_active_queue_for_player(
+            guild_id, interaction.user.id
+        )
+        if existing_other is not None:
+            await self._reject_double_booking(interaction, existing_other)
+            return
         test_mode = deps.settings_module.get_guild_settings(str(guild_id))["managed"].get(
             "testMode",
             False,
@@ -440,8 +729,11 @@ class PartyLobbyService:
             guild_id=guild_id,
             organizer_id=interaction.user.id,
             capacity=capacity,
+            # Issue #63: recruiting queues expire from inactivity, not from a
+            # single fixed timer — this is the starting clock, extended by
+            # touch_recruiting_activity() on every meaningful action.
             expires_at=datetime.now(timezone.utc)
-            + timedelta(minutes=10 if test_mode else 120),
+            + timedelta(minutes=10 if test_mode else 60),
             operation_id=f"discord:{interaction.id}:create",
             mode=str(payload["mode"]),
             region=str(payload["region"]),
@@ -449,6 +741,7 @@ class PartyLobbyService:
             voice_required=bool(payload["voice_required"]),
             skill_band=str(payload.get("skill_band") or ""),
             notes=str(payload.get("notes") or ""),
+            display_name=str(payload.get("queue_name") or ""),
         )
         profile = deps.party_repository.get_player_preferences(guild_id, interaction.user.id)
         lobby = deps.party_repository.save_participant(
@@ -464,9 +757,142 @@ class PartyLobbyService:
             operation_id=f"discord:{interaction.id}:organizer",
         )
         await self.ensure_party_queue(lobby)
+
+        # Issue #63: creation now auto-publishes the canonical public card —
+        # a normal organizer never has to click Share/Repost afterwards.
+        posted = False
+        if interaction.guild is not None:
+            lobby, posted = await self.ensure_public_lobby_card(lobby, interaction.guild)
+        if posted:
+            confirmation = f"**{lobby.display_title()}** (`{lobby.queue_code}`) is live in the Play channel."
+        elif lobby.delivery.panel_channel_id:
+            confirmation = f"**{lobby.display_title()}** (`{lobby.queue_code}`) is ready."
+        else:
+            confirmation = (
+                f"**{lobby.display_title()}** (`{lobby.queue_code}`) was created, but no "
+                "GodForge Play channel is configured yet. Run `/party setup`, then use "
+                "Queue Settings → Repost Queue."
+            )
         await interaction.response.send_message(
-            embed=self.lobby_card_embed(lobby),
-            view=deps.lobby_card_view(),
+            content=confirmation,
+            embed=self.lobby_card_embed(lobby, interaction.guild),
+            view=deps.recruiting_card_view(),
+            ephemeral=True,
+        )
+
+    async def start_join_flow(self, interaction: discord.Interaction, lobby) -> None:
+        """Route a Join Queue click to the fastest valid path.
+
+        Issue #63: a returning player with a saved primary role joins
+        immediately using those saved preferences; a first-time player (or
+        one without enough saved preference) sees the short role wizard
+        instead. Neither path ever asks for captain willingness here.
+        """
+        deps = self.deps
+        guild_id = interaction.guild_id
+        if guild_id is None:
+            await interaction.response.send_message("Server-only action.", ephemeral=True)
+            return
+        if lobby.participant(interaction.user.id) is not None:
+            await interaction.response.send_message(
+                f"You're already in **{lobby.display_title()}**.", ephemeral=True
+            )
+            return
+        existing_other = await self.find_active_queue_for_player(
+            guild_id, interaction.user.id, exclude_lobby_id=lobby.lobby_id
+        )
+        if existing_other is not None:
+            await self._reject_double_booking(interaction, existing_other)
+            return
+        saved = deps.party_repository.get_player_preferences(guild_id, interaction.user.id)
+        if saved.primary_role:
+            payload = {
+                "primary_role": saved.primary_role,
+                "secondary_role": saved.secondary_role or "",
+                "fill": saved.fill,
+                "captain": saved.captain,
+            }
+            await self.join_lobby_from_preferences(
+                interaction, lobby.lobby_id, payload, change_roles_prompt=True,
+            )
+            return
+
+        async def join_handler(join_interaction, join_payload):
+            await self.join_lobby_from_preferences(join_interaction, lobby.lobby_id, join_payload)
+
+        await interaction.response.send_message(
+            f"Choose your role preferences for **{lobby.display_title()}**.",
+            view=deps.join_preferences_view(join_handler),
+            ephemeral=True,
+        )
+
+    async def _open_change_roles(self, interaction: discord.Interaction, lobby_id: str) -> None:
+        deps = self.deps
+        guild_id = interaction.guild_id
+        lobby = deps.party_repository.get(guild_id, lobby_id) if guild_id else None
+        title = lobby.display_title() if lobby else "this queue"
+
+        async def join_handler(join_interaction, join_payload):
+            await self.join_lobby_from_preferences(join_interaction, lobby_id, join_payload)
+
+        await interaction.response.send_message(
+            f"Update your role preferences for **{title}**.",
+            view=deps.join_preferences_view(join_handler),
+            ephemeral=True,
+        )
+
+    async def find_active_queue_for_player(
+        self, guild_id: int, user_id: int, *, exclude_lobby_id: str | None = None
+    ):
+        """The player's other active queue in this guild, if any.
+
+        Issue #63 locked-in rule: one active queue per player per guild.
+        A waitlisted player is *not* written to the durable
+        ``party_participants`` table (only active-roster members are), so a
+        check against ``lobby.participant()`` alone would miss them and let
+        them double-book — this also consults the live queue's
+        active/waitlist membership, which is where a waitlisted player
+        actually lives until they're promoted.
+        """
+        deps = self.deps
+        for record in deps.party_repository.recover_active(guild_id):
+            lobby = record.lobby
+            if lobby.lobby_id == exclude_lobby_id:
+                continue
+            if lobby.participant(user_id) is not None:
+                return lobby
+            queue = await deps.party_queue_service.get(lobby.lobby_id)
+            if queue is not None and any(
+                member.user_id == user_id for member in (*queue.active, *queue.waitlist)
+            ):
+                return lobby
+        return None
+
+    async def _reject_double_booking(
+        self, interaction: discord.Interaction, existing_lobby
+    ) -> None:
+        """Issue #63 locked-in rule: one active queue per player per guild."""
+        deps = self.deps
+
+        async def leave_other(leave_interaction: discord.Interaction) -> None:
+            changed = await self._process_leave(
+                leave_interaction, existing_lobby.lobby_id, leave_interaction.user.id
+            )
+            if changed is None:
+                await leave_interaction.response.send_message(
+                    "That queue is no longer active.", ephemeral=True
+                )
+                return
+            await leave_interaction.response.send_message(
+                f"Left **{existing_lobby.display_title()}**. Click Join Queue again to switch.",
+                ephemeral=True,
+            )
+
+        await interaction.response.send_message(
+            f"You're already in **{existing_lobby.display_title()}** "
+            f"(`{existing_lobby.queue_code}`). Leave it first if you want to join a "
+            "different queue.",
+            view=deps.already_in_queue_view(leave_other),
             ephemeral=True,
         )
 
@@ -475,36 +901,55 @@ class PartyLobbyService:
         interaction: discord.Interaction,
         lobby_id: str,
         payload: dict[str, object],
+        *,
+        change_roles_prompt: bool = False,
     ) -> None:
         deps = self.deps
         guild_id = interaction.guild_id
         if guild_id is None:
             await interaction.response.send_message("Server-only action.", ephemeral=True)
             return
+        lobby = deps.party_repository.get(guild_id, lobby_id)
+        if lobby is None:
+            await interaction.response.send_message(
+                "That queue no longer exists. Use Find a Queue to pick an active one.",
+                ephemeral=True,
+            )
+            return
+        # Issue #63 locked-in edge case: a player may only be active in one
+        # queue per guild at a time. Checked before any state changes.
+        existing_other = await self.find_active_queue_for_player(
+            guild_id, interaction.user.id, exclude_lobby_id=lobby_id
+        )
+        if existing_other is not None:
+            await self._reject_double_booking(interaction, existing_other)
+            return
+        current_profile = deps.party_repository.get_player_preferences(
+            guild_id, interaction.user.id
+        )
         profile = PlayerPreferences(
             str(payload["primary_role"]),
             str(payload.get("secondary_role") or "") or None,
             bool(payload["fill"]),
-            bool(payload["captain"]),
+            # Captain willingness is no longer collected by the join wizard;
+            # whatever was already saved in My Preferences carries over.
+            bool(payload["captain"]) if "captain" in payload else current_profile.captain,
         )
         deps.party_repository.set_player_preferences(
             guild_id,
             interaction.user.id,
             profile,
         )
-        lobby = deps.party_repository.get(guild_id, lobby_id)
-        if lobby is None:
-            await interaction.response.send_message(
-                "That lobby no longer exists. Browse lobbies and choose an active one.",
-                ephemeral=True,
-            )
-            return
         await self.ensure_party_queue(lobby)
-        queue, destination = await deps.party_queue_service.join(
-            lobby_id,
-            interaction.user.id,
-            profile.roles,
-        )
+        try:
+            queue, destination = await deps.party_queue_service.join(
+                lobby_id,
+                interaction.user.id,
+                profile.roles,
+            )
+        except QueueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
         if destination in {"active", "unchanged"}:
             changed = deps.party_repository.save_participant(
                 guild_id,
@@ -520,25 +965,38 @@ class PartyLobbyService:
             )
         else:
             changed = lobby
-        if interaction.message is not None:
-            await interaction.message.edit(
-                embed=self.lobby_card_embed(changed),
-                view=deps.lobby_card_view(),
+        if changed.state in {LobbyState.OPEN, LobbyState.FULL}:
+            changed = deps.party_repository.touch_recruiting_activity(
+                guild_id, lobby_id, operation_id=f"discord:{interaction.id}:touch"
             )
-            await interaction.response.send_message(
-                (
-                    f"Joined lobby `{changed.lobby_id[:8]}`."
-                    if destination != "waitlist"
-                    else f"Lobby is full; added to waitlist position {len(queue.waitlist)}."
-                ),
-                ephemeral=True,
+
+        # The click may have come from an ephemeral join wizard (or the fast
+        # saved-preference path) rather than the public queue card itself.
+        # Always refresh the saved public projection via its stored delivery
+        # reference instead of assuming this interaction's own message is
+        # that card.
+        if interaction.guild is not None:
+            await self.refresh_public_lobby_card(changed, interaction.guild)
+
+        if destination == "waitlist":
+            ack = (
+                f"**{changed.display_title()}** is full; added to the waitlist at "
+                f"position {len(queue.waitlist)}."
             )
         else:
-            await interaction.response.send_message(
-                embed=self.lobby_card_embed(changed),
-                view=deps.lobby_card_view(),
-                ephemeral=True,
+            role_summary = "/".join(profile.roles) or "Fill"
+            ack = (
+                f"Joined **{changed.display_title()}** as {role_summary} · "
+                f"{len(changed.participants)}/{changed.capacity}."
             )
+        ack_view = None
+        if change_roles_prompt:
+            async def change_roles_handler(cr_interaction: discord.Interaction) -> None:
+                await self._open_change_roles(cr_interaction, lobby_id)
+
+            ack_view = deps.change_roles_view(change_roles_handler)
+        await interaction.response.send_message(ack, view=ack_view, ephemeral=True)
+
         if len(queue.active) == queue.capacity and queue.status is QueueStatus.OPEN:
             queue = await deps.party_queue_service.start_ready_check(lobby_id)
             if changed.state is LobbyState.OPEN:
@@ -549,18 +1007,108 @@ class PartyLobbyService:
                     operation_id=f"discord:{interaction.id}:full",
                 )
             if changed.state is LobbyState.FULL:
-                deps.party_repository.transition(
+                changed = deps.party_repository.transition(
                     guild_id,
                     lobby_id,
                     LobbyState.READY_CHECK,
                     operation_id=f"discord:{interaction.id}:ready-check",
                 )
-            await interaction.channel.send(
-                content=" ".join(f"<@{member.user_id}>" for member in queue.active),
-                embed=self.ready_check_embed(lobby_id, queue),
-                view=deps.ready_check_view(),
-                allowed_mentions=discord.AllowedMentions(users=True, roles=False),
+            if interaction.guild is not None:
+                await self.refresh_public_lobby_card(changed, interaction.guild)
+                await self.ensure_ready_check_card(
+                    changed, interaction.guild, queue, fallback_channel=interaction.channel,
+                )
+
+    # -- Leave / organizer succession ----------------------------------------
+
+    async def _apply_organizer_succession(
+        self, guild_id: int, lobby_id: str, changed, departed_user_id: int,
+        *, operation_prefix: str, actor_id: int,
+    ):
+        """Issue #63 locked-in edge case: a queue is never left organizer-less.
+
+        If the departing player was the organizer, ownership transfers
+        automatically to the longest-tenured remaining participant; if no
+        one remains, the queue is cancelled. Otherwise this is a no-op.
+        """
+        deps = self.deps
+        if changed.organizer_id != departed_user_id or changed.is_terminal:
+            return changed
+        remaining = sorted(changed.participants, key=lambda participant: participant.joined_at)
+        if remaining:
+            return deps.party_repository.transfer_organizer(
+                guild_id, lobby_id, remaining[0].user_id,
+                operation_id=f"{operation_prefix}:auto-transfer",
+                actor_id=actor_id,
             )
+        return deps.party_repository.transition(
+            guild_id, lobby_id, LobbyState.CANCELLED,
+            operation_id=f"{operation_prefix}:auto-cancel-empty",
+            actor_id=actor_id,
+            reason="organizer left an empty queue",
+        )
+
+    async def _process_leave(
+        self, interaction: discord.Interaction, lobby_id: str, user_id: int
+    ):
+        """Leave a queue from any context — the regular Leave button, or the
+        cross-queue "Leave That Queue" double-booking recovery action.
+
+        Issue #63 fix: a departure during an active ready check must behave
+        like the Ready Check Drop button (the whole roster's ready state
+        resets and the lobby reopens to OPEN), not like a plain queue
+        ``leave()`` — otherwise the queue is left stuck in READY_CHECK with
+        a roster that can now never all become Ready again.
+        """
+        deps = self.deps
+        guild_id = interaction.guild_id
+        lobby = deps.party_repository.get(guild_id, lobby_id)
+        if lobby is None:
+            return None
+        queue = await self.ensure_party_queue(lobby)
+        dropping_from_ready_check = lobby.state is LobbyState.READY_CHECK and any(
+            member.user_id == user_id for member in queue.active
+        )
+        if dropping_from_ready_check:
+            queue, promoted_id = await deps.party_queue_service.respond(
+                lobby_id, user_id, ReadyStatus.DROP
+            )
+        else:
+            queue, promoted_id = await deps.party_queue_service.leave(lobby_id, user_id)
+        changed = deps.party_repository.remove_participant(
+            guild_id, lobby_id, user_id,
+            operation_id=f"discord:{interaction.id}:leave",
+            actor_id=user_id,
+        )
+        if promoted_id is not None:
+            promoted = deps.party_repository.get_player_preferences(guild_id, promoted_id)
+            changed = deps.party_repository.save_participant(
+                guild_id, lobby_id,
+                Participant(
+                    promoted_id,
+                    primary_role=promoted.primary_role,
+                    secondary_role=promoted.secondary_role,
+                    fill=promoted.fill,
+                    captain=promoted.captain,
+                ),
+                operation_id=f"discord:{interaction.id}:promote:{promoted_id}",
+            )
+        if dropping_from_ready_check and changed.state is LobbyState.READY_CHECK:
+            changed = deps.party_repository.transition(
+                guild_id, lobby_id, LobbyState.OPEN,
+                operation_id=f"discord:{interaction.id}:reopen",
+            )
+        changed = await self._apply_organizer_succession(
+            guild_id, lobby_id, changed, user_id,
+            operation_prefix=f"discord:{interaction.id}", actor_id=user_id,
+        )
+        if changed.state in {LobbyState.OPEN, LobbyState.FULL}:
+            changed = deps.party_repository.touch_recruiting_activity(
+                guild_id, lobby_id, operation_id=f"discord:{interaction.id}:touch"
+            )
+        if interaction.guild is not None:
+            await self.refresh_public_lobby_card(changed, interaction.guild)
+        return changed
 
     # -- Lobby card -----------------------------------------------------------
 
@@ -580,52 +1128,127 @@ class PartyLobbyService:
         lobby = deps.party_repository.get(guild_id, lobby_id)
         if lobby is None or lobby_id not in active_ids:
             await interaction.response.send_message(
-                "That lobby is no longer active.",
+                "That queue is no longer active.",
                 ephemeral=True,
             )
             return
         if action == "join":
-            async def join_handler(join_interaction, payload):
-                await self.join_lobby_from_preferences(join_interaction, lobby_id, payload)
-
+            await self.start_join_flow(interaction, lobby)
+            return
+        if action == "leave":
+            changed = await self._process_leave(interaction, lobby_id, interaction.user.id)
+            await interaction.response.send_message("Left the queue.", ephemeral=True)
+            return
+        if action == "queue_settings":
+            if interaction.user.id != lobby.organizer_id:
+                await interaction.response.send_message(
+                    "Only the organizer can open Queue Settings.", ephemeral=True
+                )
+                return
             await interaction.response.send_message(
-                "Choose your lobby role preferences.",
-                view=deps.join_preferences_view(join_handler),
+                embed=self.lobby_card_embed(lobby, interaction.guild),
+                view=deps.queue_settings_view(),
                 ephemeral=True,
             )
             return
-        if action == "leave":
-            await self.ensure_party_queue(lobby)
-            queue, promoted_id = await deps.party_queue_service.leave(
-                lobby_id,
-                interaction.user.id,
-            )
-            changed = deps.party_repository.remove_participant(
-                guild_id,
-                lobby_id,
-                interaction.user.id,
-                operation_id=f"discord:{interaction.id}:leave",
-                actor_id=interaction.user.id,
-            )
-            if promoted_id is not None:
-                promoted = deps.party_repository.get_player_preferences(
-                    guild_id, promoted_id
+        if action == "rename":
+            if interaction.user.id != lobby.organizer_id:
+                await interaction.response.send_message(
+                    "Only the organizer can rename this queue.", ephemeral=True
                 )
-                changed = deps.party_repository.save_participant(
-                    guild_id,
-                    lobby_id,
-                    Participant(
-                        promoted_id,
-                        primary_role=promoted.primary_role,
-                        secondary_role=promoted.secondary_role,
-                        fill=promoted.fill,
-                        captain=promoted.captain,
-                    ),
-                    operation_id=f"discord:{interaction.id}:promote:{promoted_id}",
+                return
+
+            async def submit_rename(modal_interaction: discord.Interaction, new_name: str) -> None:
+                try:
+                    renamed = deps.party_repository.rename(
+                        guild_id, lobby_id, new_name,
+                        operation_id=f"discord:{modal_interaction.id}:rename",
+                        actor_id=modal_interaction.user.id,
+                    )
+                except (PermissionError, ValueError) as exc:
+                    await modal_interaction.response.send_message(str(exc), ephemeral=True)
+                    return
+                if renamed.state in {LobbyState.OPEN, LobbyState.FULL}:
+                    renamed = deps.party_repository.touch_recruiting_activity(
+                        guild_id, lobby_id,
+                        operation_id=f"discord:{modal_interaction.id}:rename-touch",
+                    )
+                if modal_interaction.guild is not None:
+                    await self.refresh_public_lobby_card(renamed, modal_interaction.guild)
+                await modal_interaction.response.send_message(
+                    f"Queue renamed to **{renamed.display_title()}**.", ephemeral=True
                 )
-            await interaction.response.edit_message(
-                embed=self.lobby_card_embed(changed),
-                view=deps.lobby_card_view(),
+
+            await interaction.response.send_modal(
+                deps.rename_modal(submit_rename, lobby.display_name)
+            )
+            return
+        if action == "repost":
+            if interaction.user.id != lobby.organizer_id:
+                await interaction.response.send_message(
+                    "Only the organizer can repost this queue.", ephemeral=True
+                )
+                return
+            changed, posted_new = await self.ensure_public_lobby_card(lobby, interaction.guild)
+            if posted_new:
+                await interaction.response.send_message(
+                    "Queue reposted to the Play channel.", ephemeral=True
+                )
+            elif changed.delivery.panel_channel_id:
+                await interaction.response.send_message(
+                    "The queue card is already live; refreshed it.", ephemeral=True
+                )
+            else:
+                await interaction.response.send_message(
+                    "No GodForge Play channel is configured yet. Run `/party setup` first.",
+                    ephemeral=True,
+                )
+            return
+        if action == "transfer_organizer":
+            if interaction.user.id != lobby.organizer_id:
+                await interaction.response.send_message(
+                    "Only the organizer can transfer ownership.", ephemeral=True
+                )
+                return
+            candidates = [p for p in lobby.participants if p.user_id != lobby.organizer_id]
+            if not candidates:
+                await interaction.response.send_message(
+                    "No other players are in this queue yet.", ephemeral=True
+                )
+                return
+            options = []
+            for participant in candidates:
+                member = (
+                    interaction.guild.get_member(participant.user_id)
+                    if interaction.guild else None
+                )
+                options.append(
+                    (participant.user_id, member.display_name if member else
+                     f"Player {participant.user_id}")
+                )
+
+            async def transfer_handler(
+                select_interaction: discord.Interaction, new_organizer_id: int
+            ) -> None:
+                try:
+                    changed = deps.party_repository.transfer_organizer(
+                        guild_id, lobby_id, new_organizer_id,
+                        operation_id=f"discord:{select_interaction.id}:transfer",
+                        actor_id=select_interaction.user.id,
+                    )
+                except (PermissionError, ValueError) as exc:
+                    await select_interaction.response.send_message(str(exc), ephemeral=True)
+                    return
+                if select_interaction.guild is not None:
+                    await self.refresh_public_lobby_card(changed, select_interaction.guild)
+                await select_interaction.response.send_message(
+                    f"<@{new_organizer_id}> is now the organizer.", ephemeral=True,
+                )
+
+            await interaction.response.send_message(
+                "Choose the new organizer.",
+                view=deps.transfer_organizer_view(transfer_handler, options),
+                ephemeral=True,
             )
             return
         if action == "ready_check":
@@ -637,7 +1260,7 @@ class PartyLobbyService:
                 return
             if lobby.state not in {LobbyState.OPEN, LobbyState.FULL}:
                 await interaction.response.send_message(
-                    "This lobby is not currently recruiting.",
+                    "This queue is not currently recruiting.",
                     ephemeral=True,
                 )
                 return
@@ -645,6 +1268,16 @@ class PartyLobbyService:
             if queue.status is not QueueStatus.OPEN:
                 await interaction.response.send_message(
                     "A ready check is already active or this queue is closed.",
+                    ephemeral=True,
+                )
+                return
+            # A manually-started ready check on an odd/undersized roster can
+            # never satisfy "everyone ready" — reject it up front rather than
+            # stranding the queue outside recruiting with no way to finish.
+            if len(queue.active) < 2 or len(queue.active) % 2:
+                await interaction.response.send_message(
+                    "Automatic formation needs an even roster of at least 2 active "
+                    "players before a ready check can start.",
                     ephemeral=True,
                 )
                 return
@@ -657,17 +1290,18 @@ class PartyLobbyService:
                     operation_id=f"discord:{interaction.id}:full",
                 )
             if lobby.state in {LobbyState.FULL, LobbyState.OPEN}:
-                deps.party_repository.transition(
+                lobby = deps.party_repository.transition(
                     guild_id,
                     lobby_id,
                     LobbyState.READY_CHECK,
                     operation_id=f"discord:{interaction.id}:ready-check",
                 )
+            await self.refresh_public_lobby_card(lobby, interaction.guild)
+            await self.ensure_ready_check_card(
+                lobby, interaction.guild, queue, fallback_channel=interaction.channel,
+            )
             await interaction.response.send_message(
-                content=" ".join(f"<@{member.user_id}>" for member in queue.active),
-                embed=self.ready_check_embed(lobby_id, queue),
-                view=deps.ready_check_view(),
-                allowed_mentions=discord.AllowedMentions(users=True, roles=False),
+                "Ready check started.", ephemeral=True,
             )
             return
         formation_actions = {
@@ -773,10 +1407,8 @@ class PartyLobbyService:
                 operation_id=f"discord:{interaction.id}:cancel",
                 actor_id=interaction.user.id,
             )
-            await interaction.response.edit_message(
-                embed=self.lobby_card_embed(changed),
-                view=None,
-            )
+            await self.refresh_public_lobby_card(changed, interaction.guild)
+            await interaction.response.send_message("Queue cancelled.", ephemeral=True)
             return
         if action == "edit":
             async def edit_handler(edit_interaction, payload):
@@ -793,10 +1425,14 @@ class PartyLobbyService:
                     skill_band=str(payload.get("skill_band") or ""),
                     notes=str(payload.get("notes") or ""),
                 )
+                if changed.state in {LobbyState.OPEN, LobbyState.FULL}:
+                    changed = deps.party_repository.touch_recruiting_activity(
+                        guild_id, lobby_id, operation_id=f"discord:{edit_interaction.id}:touch"
+                    )
+                if edit_interaction.guild is not None:
+                    await self.refresh_public_lobby_card(changed, edit_interaction.guild)
                 await edit_interaction.response.send_message(
-                    embed=self.lobby_card_embed(changed),
-                    view=deps.lobby_card_view(),
-                    ephemeral=True,
+                    "Queue details updated.", ephemeral=True,
                 )
 
             initial = {
@@ -814,43 +1450,9 @@ class PartyLobbyService:
             )
             return
         if action == "share":
-            delivery = lobby.delivery
-            if delivery.panel_channel_id and delivery.panel_message_id:
-                existing_channel = interaction.guild.get_channel(
-                    delivery.panel_channel_id
-                )
-                if existing_channel is not None and hasattr(
-                    existing_channel, "fetch_message"
-                ):
-                    try:
-                        existing_message = await existing_channel.fetch_message(
-                            delivery.panel_message_id
-                        )
-                        await existing_message.edit(
-                            embed=self.lobby_card_embed(lobby),
-                            view=deps.lobby_card_view(),
-                        )
-                        await interaction.response.send_message(
-                            "Existing lobby share refreshed.", ephemeral=True
-                        )
-                        return
-                    except (discord.NotFound, discord.HTTPException, AttributeError):
-                        pass
-            await interaction.response.send_message("Lobby shared.", ephemeral=True)
-            message = await interaction.channel.send(
-                embed=self.lobby_card_embed(lobby),
-                view=deps.lobby_card_view(),
-            )
-            deps.party_repository.set_delivery(
-                guild_id,
-                lobby_id,
-                replace(
-                    lobby.delivery,
-                    panel_channel_id=interaction.channel.id,
-                    panel_message_id=message.id,
-                ),
-                operation_id=f"public-lobby-delivery:{lobby_id}:{message.id}",
-            )
+            # Legacy custom_id kept recoverable for cards posted before Issue
+            # #63; behaves the same as the new "repost" action.
+            await self.handle_lobby_card_action(interaction, "repost")
 
     # -- Draft launch ---------------------------------------------------------
 
@@ -984,7 +1586,7 @@ class PartyLobbyService:
                 if result.get("state"):
                     deps.draft_coordinator.snapshots[channel.id] = result["state"]
                     sent = await channel.send(
-                        f"🎮 Draft `{activity_id}` started — open the Activity and "
+                        f"\U0001f3ae Draft `{activity_id}` started — open the Activity and "
                         "enter this ID to join",
                         embed=deps.formatter.format_board_from_snapshot(result["state"]),
                     )
@@ -1019,7 +1621,7 @@ class PartyLobbyService:
                 await self.refresh_public_lobby_card(active_lobby, interaction.guild)
             formation = launch.snapshot.get("formation") or {}
             assignment_lines = []
-            for side, emoji in (("blue", "🔵"), ("red", "🔴")):
+            for side, emoji in (("blue", "\U0001f535"), ("red", "\U0001f534")):
                 assignments = formation.get(side) or []
                 assignment_lines.append(
                     f"{emoji} "
@@ -1038,9 +1640,9 @@ class PartyLobbyService:
                 )
             await channel.send(
                 f"⚔️ Draft `{launch.match_id}` launched from lobby `{lobby.lobby_id[:8]}`.\n"
-                f"🔵 Captain <@{launch.blue.captain_id}>: "
+                f"\U0001f535 Captain <@{launch.blue.captain_id}>: "
                 + " ".join(f"<@{user_id}>" for user_id in launch.blue.participant_ids)
-                + f"\n🔴 Captain <@{launch.red.captain_id}>: "
+                + f"\n\U0001f534 Captain <@{launch.red.captain_id}>: "
                 + " ".join(f"<@{user_id}>" for user_id in launch.red.participant_ids)
                 + formation_summary,
                 allowed_mentions=discord.AllowedMentions(users=True, roles=False),
@@ -1053,7 +1655,7 @@ class PartyLobbyService:
                 f"Draft `{launch.match_id}` started. Teams and lobby rules are retained.",
                 ephemeral=True,
             )
-        except Exception:
+        except Exception as exc:
             if launch is not None and not draft_started:
                 deps.party_draft_repository.mark_failed(lobby.lobby_id, str(exc))
             deps.log.exception(
@@ -1075,6 +1677,116 @@ class PartyLobbyService:
 
     # -- Ready check ------------------------------------------------------------
 
+    async def _handoff_lock_for(self, lobby_id: str) -> asyncio.Lock:
+        async with self._handoff_locks_guard:
+            return self._handoff_locks.setdefault(lobby_id, asyncio.Lock())
+
+    async def _send_match_ready_handoff(self, lobby, guild, rooms) -> None:
+        """Send the one-time roster ping with a clickable channel mention.
+
+        Issue #63: this must happen exactly once per successful handoff, no
+        matter how many times the final Ready response (or a recovery pass)
+        replays this lobby. Gating on the durable
+        ``delivery.match_ready_notified`` flag — rather than only on the
+        state transition — means a retry after a *failed* send still gets a
+        chance to actually deliver the ping.
+        """
+        deps = self.deps
+        if lobby.delivery.match_ready_notified:
+            return
+        channel_id = lobby.delivery.ready_channel_id or lobby.delivery.panel_channel_id
+        channel = guild.get_channel(channel_id) if channel_id else None
+        if channel is None or not hasattr(channel, "send"):
+            channel = guild.get_channel(rooms.text_room_id)
+        if channel is None or not hasattr(channel, "send"):
+            return
+        mentions = " ".join(f"<@{participant.user_id}>" for participant in lobby.participants)
+        try:
+            await channel.send(
+                content=(
+                    f"{mentions}\n\nMatch ready! Continue in <#{rooms.text_room_id}>."
+                ),
+                allowed_mentions=discord.AllowedMentions(users=True, roles=False),
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            deps.log.exception(
+                "Match-ready roster ping failed for lobby %s", lobby.lobby_id
+            )
+            return
+        deps.party_repository.set_delivery(
+            lobby.guild_id,
+            lobby.lobby_id,
+            replace(lobby.delivery, match_ready_notified=True),
+            operation_id=f"match-ready-notified:{lobby.lobby_id}",
+        )
+
+    async def _complete_ready_check(
+        self, interaction: discord.Interaction, guild_id: int, lobby_id: str, queue
+    ) -> None:
+        """Advance a fully-ready queue into forming, exactly once.
+
+        Callers must hold the per-lobby handoff lock before calling this —
+        see ``handle_ready_check_action``.
+        """
+        deps = self.deps
+        room_failure = None
+        lobby = deps.party_repository.get(guild_id, lobby_id)
+        rooms = None
+        if lobby and interaction.guild and lobby.state is LobbyState.READY_CHECK:
+            try:
+                rooms = await deps.match_room_service_for_guild(
+                    interaction.guild
+                ).provision(
+                    guild_id=guild_id,
+                    lobby_id=lobby_id,
+                    organizer_id=lobby.organizer_id,
+                    participant_ids=tuple(
+                        participant.user_id for participant in lobby.participants
+                    ),
+                    create_team_voice=lobby.voice_required,
+                )
+                lobby = await self.ensure_match_formation_card(
+                    lobby, interaction.guild, rooms
+                )
+            except (discord.Forbidden, discord.HTTPException, RuntimeError) as exc:
+                room_failure = str(exc)
+            except Exception:
+                deps.log.exception(
+                    "Private match-room handoff failed for lobby %s", lobby_id
+                )
+                room_failure = "GodForge could not save the private-room handoff."
+        if (
+            room_failure is None
+            and lobby
+            and lobby.state is LobbyState.READY_CHECK
+        ):
+            lobby = deps.party_repository.transition(
+                guild_id,
+                lobby_id,
+                LobbyState.FORMING,
+                operation_id=f"discord:{interaction.id}:forming",
+            )
+            await self.refresh_public_lobby_card(lobby, interaction.guild)
+        if (
+            room_failure is None
+            and lobby
+            and lobby.state is LobbyState.FORMING
+            and rooms is not None
+        ):
+            # One in-server ping with a real channel mention — never DMs —
+            # per the Issue #63 match-ready handoff contract.
+            await self._send_match_ready_handoff(lobby, interaction.guild, rooms)
+        await interaction.response.edit_message(
+            content=(
+                "Everyone is ready. GodForge is forming the match."
+                if room_failure is None
+                else "Everyone is ready, but GodForge could not create temporary "
+                f"rooms: {room_failure}. Fix the permission and press Ready again."
+            ),
+            embed=self.ready_check_embed(lobby_id, queue),
+            view=(None if room_failure is None else deps.ready_check_view()),
+        )
+
     async def handle_ready_check_action(
         self, interaction: discord.Interaction, action: str
     ) -> None:
@@ -1089,11 +1801,15 @@ class PartyLobbyService:
             "need_five": ReadyStatus.NEED_5,
             "drop": ReadyStatus.DROP,
         }[action]
-        queue, promoted_id = await deps.party_queue_service.respond(
-            lobby_id,
-            interaction.user.id,
-            status,
-        )
+        try:
+            queue, promoted_id = await deps.party_queue_service.respond(
+                lobby_id,
+                interaction.user.id,
+                status,
+            )
+        except QueueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
         if status is ReadyStatus.DROP:
             changed = deps.party_repository.remove_participant(
                 guild_id,
@@ -1118,13 +1834,23 @@ class PartyLobbyService:
                     ),
                     operation_id=f"discord:{interaction.id}:ready-promote:{promoted_id}",
                 )
+            changed = await self._apply_organizer_succession(
+                guild_id, lobby_id, changed, interaction.user.id,
+                operation_prefix=f"discord:{interaction.id}", actor_id=interaction.user.id,
+            )
             if changed.state is LobbyState.READY_CHECK:
-                deps.party_repository.transition(
+                changed = deps.party_repository.transition(
                     guild_id,
                     lobby_id,
                     LobbyState.OPEN,
                     operation_id=f"discord:{interaction.id}:reopen",
                 )
+            if changed.state in {LobbyState.OPEN, LobbyState.FULL}:
+                changed = deps.party_repository.touch_recruiting_activity(
+                    guild_id, lobby_id, operation_id=f"discord:{interaction.id}:touch"
+                )
+            if interaction.guild is not None:
+                await self.refresh_public_lobby_card(changed, interaction.guild)
         everyone_ready = bool(queue.active) and all(
             queue.ready.get(member.user_id) is ReadyStatus.READY
             for member in queue.active
@@ -1148,53 +1874,11 @@ class PartyLobbyService:
                     view=deps.ready_check_view(),
                 )
                 return
-            room_failure = None
-            lobby = deps.party_repository.get(guild_id, lobby_id)
-            if lobby and interaction.guild:
-                try:
-                    rooms = await deps.match_room_service_for_guild(
-                        interaction.guild
-                    ).provision(
-                        guild_id=guild_id,
-                        lobby_id=lobby_id,
-                        organizer_id=lobby.organizer_id,
-                        participant_ids=tuple(
-                            participant.user_id for participant in lobby.participants
-                        ),
-                        create_team_voice=lobby.voice_required,
-                    )
-                    lobby = await self.ensure_match_formation_card(
-                        lobby, interaction.guild, rooms
-                    )
-                except (discord.Forbidden, discord.HTTPException, RuntimeError) as exc:
-                    room_failure = str(exc)
-                except Exception:
-                    deps.log.exception(
-                        "Private match-room handoff failed for lobby %s", lobby_id
-                    )
-                    room_failure = "GodForge could not save the private-room handoff."
-            if (
-                room_failure is None
-                and lobby
-                and lobby.state is LobbyState.READY_CHECK
-            ):
-                lobby = deps.party_repository.transition(
-                    guild_id,
-                    lobby_id,
-                    LobbyState.FORMING,
-                    operation_id=f"discord:{interaction.id}:forming",
-                )
-                await self.refresh_public_lobby_card(lobby, interaction.guild)
-            await interaction.response.edit_message(
-                content=(
-                    "Everyone is ready. GodForge is forming the match."
-                    if room_failure is None
-                    else "Everyone is ready, but GodForge could not create temporary "
-                    f"rooms: {room_failure}. Fix the permission and press Ready again."
-                ),
-                embed=self.ready_check_embed(lobby_id, queue),
-                view=(None if room_failure is None else deps.ready_check_view()),
-            )
+            # Issue #63: serialize the "final Ready" handoff per lobby so a
+            # double-click or a retried interaction can't provision two
+            # rooms or send two match-ready pings.
+            async with await self._handoff_lock_for(lobby_id):
+                await self._complete_ready_check(interaction, guild_id, lobby_id, queue)
             return
         await interaction.response.edit_message(
             embed=self.ready_check_embed(lobby_id, queue),
@@ -1206,29 +1890,64 @@ class PartyLobbyService:
                 allowed_mentions=discord.AllowedMentions(users=True, roles=False),
             )
 
-    # -- Ready-check expiry (periodic cleanup) -------------------------------
+    # -- Restart recovery + periodic cleanup ---------------------------------
 
     async def recover_match_controls(self, ctx: LifecycleContext) -> None:
-        """Reconcile private formation controls from lobby and room records."""
+        """Reconcile durable Discord projections for every active queue.
+
+        Issue #63: restart recovery must restore controls for *all* active
+        lifecycle stages, not just forming/active matches — a recruiting
+        queue's public card and an in-progress ready check both need to
+        still be usable after a restart.
+        """
         deps = self.deps
         for record in deps.party_repository.recover_active():
             lobby = record.lobby
-            if lobby.state not in {LobbyState.FORMING, LobbyState.ACTIVE}:
-                continue
             guild = ctx.get_guild(lobby.guild_id)
             if guild is None:
                 continue
             try:
-                rooms = await deps.match_room_service_for_guild(guild).get(
-                    lobby.lobby_id
-                )
-                if rooms is None:
-                    continue
-                lobby = await self.ensure_match_formation_card(lobby, guild, rooms)
-                await self.refresh_public_lobby_card(lobby, guild)
+                if lobby.state in {LobbyState.OPEN, LobbyState.FULL}:
+                    await self.ensure_public_lobby_card(lobby, guild)
+                elif lobby.state is LobbyState.READY_CHECK:
+                    queue = await deps.party_queue_service.get(lobby.lobby_id)
+                    if queue is not None:
+                        await self.ensure_ready_check_card(lobby, guild, queue)
+                    await self.refresh_public_lobby_card(lobby, guild)
+                    # Half-Shell review follow-up (PR #64, POOL-002): if room
+                    # provisioning succeeded but posting the formation card
+                    # then failed right before a crash, the lobby is left in
+                    # READY_CHECK with match rooms already live. Restart
+                    # recovery does not auto-resume that handoff — doing so
+                    # with no live Discord interaction to author the
+                    # response would trade a self-healing (a player
+                    # re-clicking Ready re-triggers completion normally) for
+                    # more risk than it removes. This just makes the stuck
+                    # state observable so it doesn't go unnoticed.
+                    stuck_rooms = await deps.match_room_service_for_guild(guild).get(
+                        lobby.lobby_id
+                    )
+                    if stuck_rooms is not None:
+                        deps.log.warning(
+                            "Lobby %s recovered in READY_CHECK with match rooms "
+                            "already provisioned — likely crashed between room "
+                            "provisioning and the FORMING transition. Self-heals "
+                            "if a player presses Ready again.",
+                            lobby.lobby_id,
+                        )
+                elif lobby.state in {LobbyState.FORMING, LobbyState.ACTIVE}:
+                    rooms = await deps.match_room_service_for_guild(guild).get(
+                        lobby.lobby_id
+                    )
+                    if rooms is None:
+                        continue
+                    lobby = await self.ensure_match_formation_card(lobby, guild, rooms)
+                    await self.refresh_public_lobby_card(lobby, guild)
+                    if lobby.state is LobbyState.FORMING:
+                        await self._send_match_ready_handoff(lobby, guild, rooms)
             except Exception:
                 deps.log.exception(
-                    "Private match-control recovery failed for lobby %s",
+                    "Restart recovery failed to restore controls for lobby %s",
                     lobby.lobby_id,
                 )
 
@@ -1237,8 +1956,22 @@ class PartyLobbyService:
 
         A timed-out queue that has been cancelled also cancels its lobby; the
         organizer's play channel (if configured) is notified either way.
+
+        This pass also sweeps every guild's recruiting queues for the
+        60-minute inactivity expiry (Issue #63) and disables/relabels each
+        newly-expired queue's public card. ``recover_active()`` performs the
+        same state transition internally, but its own return value can never
+        include a lobby it just moved to the terminal EXPIRED state — so the
+        explicit ``expire_due_recruitment()`` call below is what a card
+        refresh has to key off of. Calling it here (as the periodic cleanup
+        hook) is also what keeps idle queues from expiring at all when no
+        further interaction ever triggers the sweep organically.
         """
         deps = self.deps
+        for expired_lobby in deps.party_repository.expire_due_recruitment():
+            guild = ctx.get_guild(expired_lobby.guild_id)
+            if guild is not None:
+                await self.refresh_public_lobby_card(expired_lobby, guild)
         for record in deps.party_repository.recover_active():
             lobby = record.lobby
             if lobby.state is not LobbyState.READY_CHECK:

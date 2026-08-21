@@ -85,16 +85,23 @@ Important status notes:
   roles. Captain, Substitute, Region, and LFG roles are optional command flags.
 - Re-running setup refreshes stored resources without duplication. Matching
   names are never silently adopted; conflicts produce a repair message.
-- The Play panel supports Create Lobby, Browse Lobbies, Join Queue, and My
-  Preferences. Preference buttons update both Discord roles and durable
-  GodForge player preferences.
-- Selection-based lobby creation captures mode, region, format, an even
-  capacity from 2 through 10, voice requirement, and skill band. Notes are the
-  only free-form modal field. Joining likewise uses constrained role, fill,
-  and captain selections.
-- Full lobbies use a durable ordered waitlist and automatically start a ready
-  check. Players can answer Ready, Need 5 Minutes, or Drop; dropped seats use
-  deterministic role-aware promotion without server-wide pings.
+- The Play panel supports Start Queue, Find a Queue, and My Roles. Role
+  buttons update both Discord roles and durable GodForge player preferences.
+- Start Queue asks only for an optional queue name; mode, region, format,
+  capacity, voice requirement, and skill band default sensibly and are only
+  customized afterward via the organizer-only Queue Settings panel. Joining
+  asks Primary role (required), Secondary role (optional), and Fill
+  (required) — a returning player with saved roles joins in one click.
+  Multiple concurrent queues in one guild are fully isolated; a player may
+  be active in only one at a time. See
+  [`docs/PARTY_QUEUE_UX.md`](docs/PARTY_QUEUE_UX.md) for the full workflow
+  and lifecycle rules.
+- Full queues use a durable ordered waitlist and automatically start a ready
+  check, which shows exactly who is still outstanding. Players can answer
+  Ready, Need 5 Minutes, or Drop; dropped seats use deterministic role-aware
+  promotion without server-wide pings. The final Ready response hands off to
+  a private match workspace automatically, with one in-server roster ping
+  and a clickable channel mention — GodForge never depends on DMs.
 - `/party schedule` creates one-time or weekly custom nights after explicit
   timezone confirmation. RSVPs retain saved roles, overflow into a waitlist,
   receive reminders, export to ICS, and open into the same durable lobby flow.
@@ -374,7 +381,7 @@ contract before smoke-testing `.rc`.
 - Stabilize the live dashboard bridge and OAuth permission checks.
 - Follow the sequencing and linked implementation issues in
   [`docs/STANDALONE_PRODUCT_PLAN.md`](docs/STANDALONE_PRODUCT_PLAN.md).
-- The `v2.3.0-rc.2` feature scope is complete. Stable `v2.3.0` remains gated
+- The `v2.3.0-rc.3` feature scope is complete. Stable `v2.3.0` remains gated
   on live Discord recovery/permission checks and Railway/public-tools smoke
   tests documented in [`RELEASE_PROCESS.md`](RELEASE_PROCESS.md).
 

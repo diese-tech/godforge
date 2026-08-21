@@ -109,7 +109,10 @@ Ready-check expiry and room reconciliation become lifecycle hooks.
   largest and most tightly-coupled surface in the whole codebase; the service
   makes its existing coupling explicit via one injected `PartyLobbyDeps` rather
   than pretending to fully decouple it in one pass — see "Known remaining
-  coupling" below.
+  coupling" below. Issue #63 later hardened this same service (auto-publish,
+  named/multi-queue support, idempotent match-ready handoff) without changing
+  this decomposition; see [`PARTY_QUEUE_UX.md`](PARTY_QUEUE_UX.md) for the
+  resulting UX and lifecycle contract.
 - **Remaining polish:** moving `on_ready`/cleanup-task party & room
   reconciliation into feature lifecycle hooks (needs `LifecycleContext` to carry
   the client) is still open; it is lower-risk than 5d and can land as a small

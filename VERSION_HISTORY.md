@@ -53,7 +53,7 @@ Latest stable release. Historical scope:
 
 ## v2.3.0 - Standalone Party Foundation
 
-Current release candidate (`v2.3.0-rc.2`). The implementation scope is
+Current release candidate (`v2.3.0-rc.3`). The implementation scope is
 complete; live Discord and Railway validation remain before the stable tag.
 
 - **Standalone product boundary**: normal GodForge workflows and help surfaces no
@@ -74,9 +74,10 @@ complete; live Discord and Railway validation remain before the stable tag.
 - **Managed role cosmetics**: permissionless role cosmetics and restart-safe
   self-assignment buttons project durable GodForge player preferences onto
   Discord roles without adopting same-named administrator roles.
-- **Guided lobby cards**: constrained Discord selects capture lobby rules,
-  even capacities from 2 through 10, structured role preferences, fill, and
-  captain willingness. Only optional notes remain free-form.
+- **Guided lobby cards**: constrained Discord selects capture lobby rules and
+  structured role preferences. Only optional queue name and notes remain
+  free-form; captain willingness is set separately via saved player
+  preferences, not during queue creation or joining.
 - **Reliable ready rosters**: concurrency-safe capacity, durable waitlists,
   role-aware substitute promotion, bounded ready-check extensions, and timeout
   cancellation survive process restarts.
@@ -116,9 +117,19 @@ complete; live Discord and Railway validation remain before the stable tag.
 - **Premade teams and scrims**: guild-scoped rosters, substitutes, regions,
   availability, captain challenges, counterproposals, check-in, locked sides,
   and canonical party/draft/result launch work without a tournament engine.
+- **Queue-first UX hardening** (`rc.3`): fixed a desync where an ephemeral
+  join interaction could edit the wrong message instead of the durable
+  public queue card. Queue creation now auto-publishes with no manual share
+  step; queues carry a stable code and optional rename-able name; multiple
+  concurrent queues per guild are isolated and explicitly chosen rather than
+  auto-selected; a player may be active in only one queue per guild;
+  recruiting queues expire after 60 minutes of inactivity; the match-ready
+  handoff is idempotent and sends exactly one in-server roster ping with a
+  clickable channel mention. See
+  [`docs/PARTY_QUEUE_UX.md`](docs/PARTY_QUEUE_UX.md).
 
 ## Future Version Gates
 
-- `v2.3`: Feature scope is complete at `rc.2`; validate setup, recovery,
+- `v2.3`: Feature scope is complete at `rc.3`; validate setup, recovery,
   permissions, Railway health, and the public tools surface before tagging.
 - `v3.0`: Full dual-use platform milestone with standalone web users and production-grade assets.

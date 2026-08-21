@@ -30,6 +30,7 @@ class FakeOperations:
         self.created_panels = 0
         self.refreshed: list[tuple[int, int]] = []
         self.failure: SetupOperationError | None = None
+        self.overwrite_repairs: list[int] = []
 
     async def guild_permissions(self):
         return self.guild_perms
@@ -50,6 +51,9 @@ class FakeOperations:
         self.channels.add(100)
         return 100
 
+    async def ensure_channel_overwrite(self, channel_id):
+        self.overwrite_repairs.append(channel_id)
+
     async def create_play_panel(self, channel_id):
         self.created_panels += 1
         self.messages.add((channel_id, 200))
@@ -68,6 +72,9 @@ async def test_first_setup_creates_channel_and_panel():
     assert result.status is SetupStatus.READY
     assert result.references == SetupReferences(100, 200)
     assert result.actions == ("channel_created", "panel_created")
+    # The freshly created channel already got the overwrite atomically at
+    # creation; reconciling it again would be a redundant Discord call.
+    assert operations.overwrite_repairs == []
 
 
 @pytest.mark.asyncio
@@ -84,6 +91,24 @@ async def test_reconcile_uses_stored_ids_and_is_idempotent():
     assert operations.created_channels == 0
     assert operations.created_panels == 0
     assert operations.refreshed == [(123, 456)]
+
+
+@pytest.mark.asyncio
+async def test_reused_channel_gets_its_overwrite_repaired_every_reconcile():
+    # A stored channel from before this hardening existed (or one that lost
+    # its overwrite to an explicit permission sync) never goes through
+    # create_play_channel again, since _resolve_channel only creates when
+    # nothing is stored. A plain re-run of /party setup must still be enough
+    # to recover it, with no destructive reset required.
+    operations = FakeOperations()
+    operations.channels.add(123)
+    operations.messages.add((123, 456))
+
+    result = await GuildSetupService(operations).reconcile(SetupReferences(123, 456))
+
+    assert result.ok
+    assert operations.overwrite_repairs == [123]
+    assert operations.created_channels == 0
 
 
 @pytest.mark.asyncio

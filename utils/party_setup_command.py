@@ -27,6 +27,15 @@ from utils.guild_setup import (
 from utils.managed_roles import ROLE_DEFINITIONS, ManagedRoleError, reconcile as reconcile_roles
 
 
+def _play_channel_bot_overwrite() -> discord.PermissionOverwrite:
+    return discord.PermissionOverwrite(
+        view_channel=True,
+        send_messages=True,
+        embed_links=True,
+        read_message_history=True,
+    )
+
+
 def play_panel_embed() -> discord.Embed:
     return discord.Embed(
         title="Play SMITE with GodForge",
@@ -104,16 +113,28 @@ class DiscordGuildSetupOperations:
         channel = await self.guild.create_text_channel(
             "godforge-play",
             reason="GodForge zero-config setup",
-            overwrites={
-                self.guild.me: discord.PermissionOverwrite(
-                    view_channel=True,
-                    send_messages=True,
-                    embed_links=True,
-                    read_message_history=True,
-                ),
-            },
+            overwrites={self.guild.me: _play_channel_bot_overwrite()},
         )
         return channel.id
+
+    async def ensure_channel_overwrite(self, channel_id: int) -> None:
+        # Repairs the same overwrite on a channel `/party setup` is reusing
+        # rather than creating — either because it predates this hardening,
+        # or because it lost its own overwrite to an explicit permission
+        # sync. Best-effort: a failure here doesn't block the rest of setup,
+        # since `_panel_permission_failure` still catches and reports any
+        # actual, current loss of visibility.
+        channel = self.guild.get_channel(channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            return
+        try:
+            await channel.set_permissions(
+                self.guild.me,
+                overwrite=_play_channel_bot_overwrite(),
+                reason="GodForge zero-config setup: repair Play channel overwrite",
+            )
+        except discord.HTTPException:
+            pass
 
     async def create_play_panel(self, channel_id: int) -> int:
         channel = self.guild.get_channel(channel_id)

@@ -45,6 +45,7 @@ def _guild(*, manage_channels=True):
     )
     panel_message = MagicMock(id=7000)
     channel.send = AsyncMock(return_value=panel_message)
+    channel.set_permissions = AsyncMock()
     guild.create_text_channel = AsyncMock(return_value=channel)
 
     def get_channel(channel_id):
@@ -59,6 +60,7 @@ def _guild(*, manage_channels=True):
             ch.id = channel.id
             ch.send = channel.send
             ch.permissions_for = channel.permissions_for
+            ch.set_permissions = channel.set_permissions
             ch.fetch_message = AsyncMock(side_effect=Exception("not found"))
             return ch
         return None
@@ -144,6 +146,29 @@ async def test_play_channel_created_with_a_bot_self_overwrite(tmp_settings):
     assert overwrite.send_messages is True
     assert overwrite.embed_links is True
     assert overwrite.read_message_history is True
+
+
+async def test_reused_play_channel_gets_its_overwrite_repaired_on_rerun(tmp_settings):
+    # A channel /party setup created before this hardening existed (or one
+    # that lost its own overwrite to an explicit permission sync) never goes
+    # through create_play_channel again on a later run, since the stored
+    # channel is simply reused. A plain re-run of setup must still repair
+    # it — no destructive /party reset should be required to recover.
+    guild = _guild()
+    interaction = _interaction(guild)
+    await bot.party_setup.callback(interaction)  # first run: creates + stores
+    guild.create_text_channel.reset_mock()
+    guild.get_channel(6000).set_permissions.reset_mock()
+
+    interaction2 = _interaction(guild)
+    await bot.party_setup.callback(interaction2)  # second run: reuses stored id
+
+    guild.create_text_channel.assert_not_awaited()
+    kwargs = guild.get_channel(6000).set_permissions.await_args.kwargs
+    assert kwargs["overwrite"].view_channel is True
+    assert kwargs["overwrite"].send_messages is True
+    assert kwargs["overwrite"].embed_links is True
+    assert kwargs["overwrite"].read_message_history is True
 
 
 # -- /party reset ---------------------------------------------------------

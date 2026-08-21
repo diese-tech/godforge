@@ -70,6 +70,8 @@ class GuildSetupOperations(Protocol):
 
     async def create_play_channel(self) -> int: ...
 
+    async def ensure_channel_overwrite(self, channel_id: int) -> None: ...
+
     async def create_play_panel(self, channel_id: int) -> int: ...
 
     async def refresh_play_panel(self, channel_id: int, message_id: int) -> None: ...
@@ -110,6 +112,15 @@ class GuildSetupService:
             channel_id = await self._resolve_channel(references, actions)
             if isinstance(channel_id, SetupResult):
                 return channel_id
+
+            if "channel_created" not in actions:
+                # A freshly created channel already got the bot's own
+                # overwrite atomically. A reused (already-stored) channel may
+                # predate that hardening, or may have lost it to an explicit
+                # permission sync — repair it on every reconcile so a plain
+                # re-run of setup is enough to recover, no destructive reset
+                # required.
+                await self.operations.ensure_channel_overwrite(channel_id)
 
             permission_failure = await self._panel_permission_failure(
                 channel_id, references

@@ -381,7 +381,7 @@ contract before smoke-testing `.rc`.
 - Stabilize the live dashboard bridge and OAuth permission checks.
 - Follow the sequencing and linked implementation issues in
   [`docs/STANDALONE_PRODUCT_PLAN.md`](docs/STANDALONE_PRODUCT_PLAN.md).
-- The `v2.3.0-rc.3` feature scope is complete. Stable `v2.3.0` remains gated
+- The `v2.3.0-rc.4` feature scope is complete. Stable `v2.3.0` remains gated
   on live Discord recovery/permission checks and Railway/public-tools smoke
   tests documented in [`RELEASE_PROCESS.md`](RELEASE_PROCESS.md).
 

@@ -113,6 +113,14 @@ class DiscordDelivery:
     # Set once the one-time match-ready roster ping has been sent, so a
     # retried/duplicated "everyone is ready" event can never send it twice.
     match_ready_notified: bool = False
+    # Issue #66: the posted "still recruiting?" inactivity-confirmation
+    # prompt. Presence of these (rather than a separate boolean/timestamp
+    # field) *is* the signal that a recruiting queue is in its second-stage
+    # grace period — absence means it's still in the ordinary first-stage
+    # recruiting clock. Cleared the moment any meaningful activity re-primes
+    # the queue, or the organizer answers either button.
+    inactivity_prompt_channel_id: int | None = None
+    inactivity_prompt_message_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

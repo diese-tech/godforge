@@ -53,7 +53,7 @@ Latest stable release. Historical scope:
 
 ## v2.3.0 - Standalone Party Foundation
 
-Current release candidate (`v2.3.0-rc.3`). The implementation scope is
+Current release candidate (`v2.3.0-rc.4`). The implementation scope is
 complete; live Discord and Railway validation remain before the stable tag.
 
 - **Standalone product boundary**: normal GodForge workflows and help surfaces no
@@ -127,9 +127,18 @@ complete; live Discord and Railway validation remain before the stable tag.
   handoff is idempotent and sends exactly one in-server roster ping with a
   clickable channel mention. See
   [`docs/PARTY_QUEUE_UX.md`](docs/PARTY_QUEUE_UX.md).
+- **Recruiting inactivity confirmation + terminal card cleanup** (`rc.4`,
+  Issue #66): replaced silent hard expiry with a two-stage flow — a one-time
+  organizer prompt ("Still recruiting?" / Keep Queue Open / Close Queue)
+  after 60 quiet minutes, then a second 60-minute grace period that
+  implicitly re-primes on any further activity. Cancelling, closing from the
+  prompt, an unanswered grace period, and a ready-check timeout that cancels
+  the lobby all now delete the public queue card instead of leaving a dead
+  "cancelled"/"expired" status behind. A periodic self-healing sweep cleans
+  up any card left over from a crash mid-cleanup.
 
 ## Future Version Gates
 
-- `v2.3`: Feature scope is complete at `rc.3`; validate setup, recovery,
+- `v2.3`: Feature scope is complete at `rc.4`; validate setup, recovery,
   permissions, Railway health, and the public tools surface before tagging.
 - `v3.0`: Full dual-use platform milestone with standalone web users and production-grade assets.

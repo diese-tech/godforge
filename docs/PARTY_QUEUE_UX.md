@@ -65,10 +65,19 @@ lifecycle guarantees, and edge-case rules — see
 - **Organizer succession.** If the organizer leaves an active queue,
   ownership transfers automatically to the longest-tenured remaining
   participant. If no participants remain, the queue is cancelled.
-- **Recruiting inactivity expiry.** A recruiting queue (OPEN/FULL) expires
-  60 minutes after its last meaningful activity — join, leave, rename, edit,
-  or waitlist promotion each push the clock back. This reuses the existing
-  `expires_at`/`recover_active()` machinery rather than a separate timer.
+- **Recruiting inactivity confirmation.** A recruiting queue (OPEN/FULL) no
+  longer hard-expires on silence. 60 minutes after its last meaningful
+  activity — join, leave, rename, edit, or waitlist promotion each push the
+  clock back — GodForge posts a one-time organizer-only prompt ("Still
+  recruiting?" with **Keep Queue Open** / **Close Queue**) and starts a
+  second 60-minute grace period. Any further meaningful activity during
+  grace implicitly re-primes the queue (no click required) and retires the
+  stale prompt. If nothing happens for the full grace period, the queue
+  auto-closes and its public card is deleted rather than left showing a
+  dead "cancelled"/"expired" status — the same deletion happens for an
+  explicit **Cancel Queue** and for a ready-check timeout that cancels the
+  lobby. This does not apply to READY_CHECK/FORMING/ACTIVE, which have their
+  own separate deadlines.
 - **Multi-queue isolation.** Concurrent queues in the same guild are fully
   independent: filling, ready-checking, or forming one never touches
   another's card, roster, or ready-check state.

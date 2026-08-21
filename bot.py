@@ -47,6 +47,7 @@ from utils.lobby_views import (
     AlreadyInQueueView,
     ChangeRolesPromptView,
     CreateLobbyWizardView,
+    InactivityPromptView,
     JoinPreferencesView,
     LobbyCardView,
     MatchFormationView,
@@ -202,6 +203,7 @@ class GodForgeClient(discord.Client):
         # (queue_settings) so it keeps routing correctly after a restart.
         self.add_view(RecruitingCardView(_handle_lobby_card_action))
         self.add_view(ReadyCheckView(_handle_ready_check_action))
+        self.add_view(InactivityPromptView(_handle_inactivity_prompt_action))
         self.add_view(MatchFormationView(_handle_lobby_card_action))
         self.add_view(MatchResultView(_handle_match_result_action))
         self.add_view(MatchContinuityView(_handle_match_continuity_action))
@@ -1029,6 +1031,10 @@ _party_lobby_deps = PartyLobbyDeps(
     already_in_queue_view=lambda handler: AlreadyInQueueView(handler),
     rename_modal=lambda handler, current_name: RenameQueueModal(handler, current_name),
     start_queue_modal=lambda handler: StartQueueModal(handler),
+    # Issue #66: persistent, so it needs the same add_view registration as
+    # RecruitingCardView/ReadyCheckView above, unlike the ephemeral-only
+    # views in this block.
+    inactivity_prompt_view=lambda: InactivityPromptView(_handle_inactivity_prompt_action),
 )
 party_lobby_service = PartyLobbyService(_party_lobby_deps)
 feature_registry.register(PartyLobbyFeature(party_lobby_service))
@@ -1043,6 +1049,12 @@ def _ready_check_embed(lobby_id: str, queue) -> discord.Embed:
 
 async def _handle_ready_check_action(interaction: discord.Interaction, action: str) -> None:
     await party_lobby_service.handle_ready_check_action(interaction, action)
+
+
+async def _handle_inactivity_prompt_action(
+    interaction: discord.Interaction, action: str
+) -> None:
+    await party_lobby_service.handle_inactivity_prompt_action(interaction, action)
 
 
 async def _handle_role_preference(interaction: discord.Interaction, role_key: str) -> None:

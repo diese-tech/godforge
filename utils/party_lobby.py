@@ -1914,6 +1914,27 @@ class PartyLobbyService:
                     if queue is not None:
                         await self.ensure_ready_check_card(lobby, guild, queue)
                     await self.refresh_public_lobby_card(lobby, guild)
+                    # Half-Shell review follow-up (PR #64, POOL-002): if room
+                    # provisioning succeeded but posting the formation card
+                    # then failed right before a crash, the lobby is left in
+                    # READY_CHECK with match rooms already live. Restart
+                    # recovery does not auto-resume that handoff — doing so
+                    # with no live Discord interaction to author the
+                    # response would trade a self-healing (a player
+                    # re-clicking Ready re-triggers completion normally) for
+                    # more risk than it removes. This just makes the stuck
+                    # state observable so it doesn't go unnoticed.
+                    stuck_rooms = await deps.match_room_service_for_guild(guild).get(
+                        lobby.lobby_id
+                    )
+                    if stuck_rooms is not None:
+                        deps.log.warning(
+                            "Lobby %s recovered in READY_CHECK with match rooms "
+                            "already provisioned — likely crashed between room "
+                            "provisioning and the FORMING transition. Self-heals "
+                            "if a player presses Ready again.",
+                            lobby.lobby_id,
+                        )
                 elif lobby.state in {LobbyState.FORMING, LobbyState.ACTIVE}:
                     rooms = await deps.match_room_service_for_guild(guild).get(
                         lobby.lobby_id

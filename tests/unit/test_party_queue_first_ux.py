@@ -898,3 +898,88 @@ async def test_first_time_join_succeeds_without_touching_secondary_role(party_re
     assert participant.primary_role == "adc"
     assert participant.secondary_role is None
     assert participant.fill is True
+
+
+# -- Half-Shell review follow-up (PR #64, POOL-002) --------------------------
+#
+# Restart recovery does not auto-resume a lobby that crashed between room
+# provisioning succeeding and the FORMING transition — a player pressing
+# Ready again self-heals it, and auto-completing during recovery with no
+# live Discord interaction to author the response would add more risk than
+# it removes. These tests pin that this is the current, intentional
+# behavior (not an accident) and that the stuck state is at least logged.
+
+
+async def test_restart_recovery_does_not_auto_complete_a_stuck_ready_check(
+    party_repos, monkeypatch
+):
+    from utils.lifecycle import LifecycleContext
+
+    party, queue_service, *_ = party_repos
+    lobby = party.create(guild_id=1, organizer_id=1, capacity=2, operation_id="create-1")
+    party.save_participant(1, lobby.lobby_id, Participant(1), operation_id="j1")
+    party.save_participant(1, lobby.lobby_id, Participant(2), operation_id="j2")
+    await queue_service.create(lobby.lobby_id, 2)
+    await queue_service.join(lobby.lobby_id, 1, ())
+    await queue_service.join(lobby.lobby_id, 2, ())
+    await queue_service.start_ready_check(lobby.lobby_id)
+    party.transition(1, lobby.lobby_id, LobbyState.FULL, operation_id="full")
+    party.transition(1, lobby.lobby_id, LobbyState.READY_CHECK, operation_id="ready")
+
+    # Simulates a crash after room provisioning succeeded but before the
+    # lobby transitioned to FORMING: rooms already exist for this lobby.
+    room_service = MagicMock()
+    room_service.get = AsyncMock(return_value=MagicMock(text_room_id=555))
+    monkeypatch.setattr(
+        bot._party_lobby_deps, "match_room_service_for_guild", lambda guild: room_service
+    )
+    mock_log = MagicMock()
+    monkeypatch.setattr(bot._party_lobby_deps, "log", mock_log)
+    guild = _guild(1)
+    ctx = MagicMock(spec=LifecycleContext)
+    ctx.get_guild = lambda guild_id: guild if guild_id == 1 else None
+
+    await bot.party_lobby_service.recover_match_controls(ctx)
+
+    # Pins the current, intentional limitation: recovery does not
+    # auto-transition the lobby out of READY_CHECK.
+    assert party.get(1, lobby.lobby_id).state is LobbyState.READY_CHECK
+    # But the stuck state is now observable rather than silent.
+    mock_log.warning.assert_called_once()
+    logged_args = mock_log.warning.call_args.args
+    assert lobby.lobby_id in logged_args
+
+
+async def test_restart_recovery_does_not_warn_for_an_ordinary_ready_check(
+    party_repos, monkeypatch
+):
+    from utils.lifecycle import LifecycleContext
+
+    party, queue_service, *_ = party_repos
+    lobby = party.create(guild_id=1, organizer_id=1, capacity=2, operation_id="create-1")
+    party.save_participant(1, lobby.lobby_id, Participant(1), operation_id="j1")
+    party.save_participant(1, lobby.lobby_id, Participant(2), operation_id="j2")
+    await queue_service.create(lobby.lobby_id, 2)
+    await queue_service.join(lobby.lobby_id, 1, ())
+    await queue_service.join(lobby.lobby_id, 2, ())
+    await queue_service.start_ready_check(lobby.lobby_id)
+    party.transition(1, lobby.lobby_id, LobbyState.FULL, operation_id="full")
+    party.transition(1, lobby.lobby_id, LobbyState.READY_CHECK, operation_id="ready")
+
+    # No rooms have been provisioned yet — this is the ordinary, common case
+    # (most ready checks recover mid-flight, not mid-crash-after-provision).
+    room_service = MagicMock()
+    room_service.get = AsyncMock(return_value=None)
+    monkeypatch.setattr(
+        bot._party_lobby_deps, "match_room_service_for_guild", lambda guild: room_service
+    )
+    mock_log = MagicMock()
+    monkeypatch.setattr(bot._party_lobby_deps, "log", mock_log)
+    guild = _guild(1)
+    ctx = MagicMock(spec=LifecycleContext)
+    ctx.get_guild = lambda guild_id: guild if guild_id == 1 else None
+
+    await bot.party_lobby_service.recover_match_controls(ctx)
+
+    assert party.get(1, lobby.lobby_id).state is LobbyState.READY_CHECK
+    mock_log.warning.assert_not_called()

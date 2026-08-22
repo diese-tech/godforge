@@ -163,19 +163,37 @@ class ScheduleRsvpService:
                     await channel.fetch_message(event.delivery_message_id)
                     await self.refresh_rsvp_card(event, guild)
                     return event, False
-                except (discord.NotFound, discord.Forbidden, discord.HTTPException,
-                        AttributeError):
-                    pass  # Stored message is gone; fall through and repost.
+                except discord.NotFound:
+                    pass  # Confirmed gone; fall through and repost.
+                except (discord.Forbidden, discord.HTTPException, AttributeError):
+                    # Can't verify the message right now (missing Read
+                    # Message History, a transient API error, ...). Leaving
+                    # the delivery ref untouched avoids posting a duplicate
+                    # on every 5-minute sweep — the next sweep retries.
+                    self.deps.log.exception(
+                        "Could not verify scheduled-night RSVP card %s", event.event_id
+                    )
+                    return event, False
         deps = self.deps
         guild_settings = deps.settings_module.get_guild_settings(str(event.guild_id))
         channel_id = guild_settings["managed"].get("playChannelId")
         channel = guild.get_channel(int(channel_id)) if channel_id else None
         if channel is None or not hasattr(channel, "send"):
             return event, False
-        message = await channel.send(
-            embed=self.rsvp_embed(event, guild),
-            view=deps.rsvp_view() if self._accepts_rsvps(event) else None,
-        )
+        try:
+            message = await channel.send(
+                embed=self.rsvp_embed(event, guild),
+                view=deps.rsvp_view() if self._accepts_rsvps(event) else None,
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            # Best-effort like every other public-card post: a failure here
+            # must never propagate into the shared periodic sweep and take
+            # down reminder delivery (or every other guild's reconciliation)
+            # with it.
+            deps.log.exception(
+                "Could not publish scheduled-night RSVP card %s", event.event_id
+            )
+            return event, False
         updated = deps.schedule_repository.set_delivery(event.event_id, channel.id, message.id)
         return updated, True
 

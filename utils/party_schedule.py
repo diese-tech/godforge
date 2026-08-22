@@ -346,10 +346,12 @@ class ScheduleRepository:
     def rsvp(self, event_id: str, user_id: int, preferences: PlayerPreferences) -> ScheduledNight:
         """Reserve a Going seat (or promote an existing Maybe response to Going).
 
-        Idempotent for a player who is already Going — matches the original
-        behavior of not overwriting their stored preferences on a repeat
-        call. A player who was Maybe is moved into the Going roster/waitlist
-        at the back of the line, same as a brand-new RSVP.
+        A player who is already Going keeps their queue position, but their
+        stored role preferences are refreshed — needed for the RSVP card's
+        "Change Roles" escape hatch, which re-submits this same call with
+        updated preferences for a player who never left Going. A player who
+        was Maybe is moved into the Going roster/waitlist at the back of the
+        line, same as a brand-new RSVP.
         """
         with self._transaction() as conn:
             event = self._required(conn, event_id)
@@ -360,37 +362,46 @@ class ScheduleRepository:
                 (event_id, user_id),
             ).fetchone()
             if prior is not None and prior["response"] == "going":
-                return self.get(event_id)
-            count = conn.execute(
-                "SELECT COUNT(*) count FROM scheduled_rsvps WHERE event_id=? AND response='going'",
-                (event_id,),
-            ).fetchone()["count"]
-            position, waitlisted = count + 1, int(count >= event["capacity"])
-            if prior is None:
                 conn.execute(
-                    """INSERT INTO scheduled_rsvps
-                       (event_id,user_id,position,waitlisted,response,primary_role,
-                        secondary_role,fill,captain,joined_at)
-                       VALUES (?,?,?,?,'going',?,?,?,?,?)""",
+                    """UPDATE scheduled_rsvps SET primary_role=?,secondary_role=?,
+                       fill=?,captain=? WHERE event_id=? AND user_id=?""",
                     (
-                        event_id, user_id, position, waitlisted,
-                        preferences.primary_role, preferences.secondary_role,
-                        int(preferences.fill), int(preferences.captain),
-                        datetime.now(timezone.utc).isoformat(),
-                    ),
-                )
-            else:
-                conn.execute(
-                    """UPDATE scheduled_rsvps SET response='going',position=?,waitlisted=?,
-                       primary_role=?,secondary_role=?,fill=?,captain=?
-                       WHERE event_id=? AND user_id=?""",
-                    (
-                        position, waitlisted,
                         preferences.primary_role, preferences.secondary_role,
                         int(preferences.fill), int(preferences.captain),
                         event_id, user_id,
                     ),
                 )
+            else:
+                count = conn.execute(
+                    "SELECT COUNT(*) count FROM scheduled_rsvps WHERE event_id=? AND response='going'",
+                    (event_id,),
+                ).fetchone()["count"]
+                position, waitlisted = count + 1, int(count >= event["capacity"])
+                if prior is None:
+                    conn.execute(
+                        """INSERT INTO scheduled_rsvps
+                           (event_id,user_id,position,waitlisted,response,primary_role,
+                            secondary_role,fill,captain,joined_at)
+                           VALUES (?,?,?,?,'going',?,?,?,?,?)""",
+                        (
+                            event_id, user_id, position, waitlisted,
+                            preferences.primary_role, preferences.secondary_role,
+                            int(preferences.fill), int(preferences.captain),
+                            datetime.now(timezone.utc).isoformat(),
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        """UPDATE scheduled_rsvps SET response='going',position=?,waitlisted=?,
+                           primary_role=?,secondary_role=?,fill=?,captain=?
+                           WHERE event_id=? AND user_id=?""",
+                        (
+                            position, waitlisted,
+                            preferences.primary_role, preferences.secondary_role,
+                            int(preferences.fill), int(preferences.captain),
+                            event_id, user_id,
+                        ),
+                    )
         return self.get(event_id)
 
     def rsvp_maybe(

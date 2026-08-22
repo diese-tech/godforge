@@ -511,3 +511,66 @@ async def test_two_sessions_in_one_guild_route_to_independent_cards(schedule_rep
     first_message.edit.assert_not_awaited()
     assert schedule.get(first.event_id).maybe == ()
     assert [r.user_id for r in schedule.get(second.event_id).maybe] == [3]
+
+
+# -- 10. Codex-fix regressions: publish failures and unverifiable reposts ----
+
+
+async def test_publish_failure_does_not_abort_the_sweep_for_other_guilds(schedule_repos):
+    from utils.lifecycle import LifecycleContext
+
+    schedule, party = schedule_repos
+    import utils.settings as settings_mod
+
+    failing = schedule.create(
+        guild_id=1, organizer_id=1, title="Forbidden Channel Night", starts_at=FUTURE,
+        timezone_name="America/New_York", recurrence=Recurrence.ONCE, capacity=10,
+        operation_id="op-forbidden",
+    )
+    schedule.confirm(failing.event_id, 1)
+    healthy = schedule.create(
+        guild_id=2, organizer_id=1, title="Healthy Guild Night", starts_at=FUTURE,
+        timezone_name="America/New_York", recurrence=Recurrence.ONCE, capacity=10,
+        operation_id="op-healthy",
+    )
+    schedule.confirm(healthy.event_id, 1)
+    settings_mod.update_guild_settings("1", {"managed": {"playChannelId": "700"}})
+    settings_mod.update_guild_settings("2", {"managed": {"playChannelId": "800"}})
+    forbidden_channel = _channel(700)
+    forbidden_channel.send = AsyncMock(side_effect=discord.Forbidden(MagicMock(), "no perms"))
+    healthy_channel = _channel(800)
+    guild_a = _guild(1, channels={700: forbidden_channel})
+    guild_b = _guild(2, channels={800: healthy_channel})
+    ctx = LifecycleContext(get_guild=lambda gid: {1: guild_a, 2: guild_b}.get(gid))
+
+    # Must not raise: a publish failure on one guild's card must never
+    # propagate out of the shared sweep and abort every other guild's
+    # reconciliation (or the reminder loop that runs after it).
+    await bot.schedule_lifecycle.on_startup(ctx)
+
+    forbidden_channel.send.assert_awaited_once()
+    healthy_channel.send.assert_awaited_once()
+    assert schedule.get(failing.event_id).delivery_message_id is None
+    assert schedule.get(healthy.event_id).delivery_message_id is not None
+
+
+async def test_reconcile_does_not_repost_when_the_card_cannot_be_verified(schedule_repos):
+    schedule, party = schedule_repos
+    event = _confirmed_event(schedule, capacity=10)
+    schedule.set_delivery(event.event_id, 600, 601)
+    unverifiable_channel = _channel(
+        600, fetch_raises=discord.Forbidden(MagicMock(), "missing read history")
+    )
+    guild = _guild(1, channels={600: unverifiable_channel})
+
+    await bot.schedule_rsvp_service.reconcile(
+        schedule.get(event.event_id), MagicMock(get_guild=lambda gid: guild)
+    )
+
+    # Forbidden/HTTPException on the existence check means "can't tell", not
+    # "gone" — must not repost a duplicate. The delivery ref stays as-is so
+    # the next sweep retries the verification instead of piling up cards.
+    unverifiable_channel.send.assert_not_awaited()
+    changed = schedule.get(event.event_id)
+    assert changed.delivery_channel_id == 600
+    assert changed.delivery_message_id == 601

@@ -85,6 +85,25 @@ def test_confirmation_rsvp_waitlist_and_promotion_survive_restart(tmp_path):
     assert promoted.rsvps[1].preferences.fill is True
 
 
+def test_repeat_rsvp_for_an_already_going_player_updates_roles_in_place(tmp_path):
+    # Issue #67's "Change Roles" flow re-submits rsvp() for a player who
+    # never left Going — their queue position must stay put, but the stored
+    # role preferences must actually change (a Codex review on PR #70 caught
+    # the original no-op-on-repeat-call behavior silently discarding this).
+    repository = ScheduleRepository(tmp_path / "party.db")
+    event = _event(repository, capacity=10)
+    repository.confirm(event.event_id, 10)
+    repository.rsvp(event.event_id, 1, PlayerPreferences("solo"))
+    repository.rsvp(event.event_id, 2, PlayerPreferences("jungle"))
+
+    changed = repository.rsvp(event.event_id, 1, PlayerPreferences("support", "mid", fill=True))
+
+    assert [r.user_id for r in changed.rsvps] == [1, 2]  # position unchanged
+    assert changed.rsvps[0].preferences.primary_role == "support"
+    assert changed.rsvps[0].preferences.secondary_role == "mid"
+    assert changed.rsvps[0].preferences.fill is True
+
+
 @pytest.mark.asyncio
 async def test_conversion_is_idempotent_and_preserves_preferences_and_waitlist(tmp_path):
     path = tmp_path / "party.db"

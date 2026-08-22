@@ -105,6 +105,8 @@ from utils.party_setup_command import (
     register_party_setup_command,
 )
 from utils.schedule_commands import ScheduleCommandDeps, register_schedule_commands
+from utils.schedule_rsvp import ScheduleRsvpDeps, ScheduleRsvpService
+from utils.schedule_views import ScheduleRsvpView
 from utils.scrim_commands import ScrimCommandDeps, register_scrim_commands
 from utils.session_commands import SessionCommandHandler
 from utils.lifecycle import FeatureRegistry, LifecycleContext
@@ -204,6 +206,7 @@ class GodForgeClient(discord.Client):
         self.add_view(RecruitingCardView(_handle_lobby_card_action))
         self.add_view(ReadyCheckView(_handle_ready_check_action))
         self.add_view(InactivityPromptView(_handle_inactivity_prompt_action))
+        self.add_view(ScheduleRsvpView(_handle_schedule_rsvp_action))
         self.add_view(MatchFormationView(_handle_lobby_card_action))
         self.add_view(MatchResultView(_handle_match_result_action))
         self.add_view(MatchContinuityView(_handle_match_continuity_action))
@@ -236,7 +239,6 @@ forgelens_adapter = ForgeLensAdapter()
 # cleanup and register it here; bot.py only orchestrates the shared phases.
 feature_registry = FeatureRegistry()
 feature_registry.register(R67Feature(r67_service))
-feature_registry.register(ScheduleLifecycle(schedule_repository))
 
 
 def _lifecycle_context() -> LifecycleContext:
@@ -883,6 +885,22 @@ party_room = party_commands.room
 party_report = party_commands.report
 
 
+# The Issue #67 scheduled-night RSVP card is its own small feature module,
+# reusing the party feature's role-picker views (injected, not imported
+# directly, to stay Discord-UI-decoupled like PartyLobbyDeps).
+_schedule_rsvp_deps = ScheduleRsvpDeps(
+    schedule_repository=schedule_repository,
+    party_repository=party_repository,
+    settings_module=settings,
+    log=log,
+    rsvp_view=lambda: ScheduleRsvpView(_handle_schedule_rsvp_action),
+    join_preferences_view=JoinPreferencesView,
+    change_roles_view=lambda handler: ChangeRolesPromptView(handler),
+)
+schedule_rsvp_service = ScheduleRsvpService(_schedule_rsvp_deps)
+schedule_lifecycle = ScheduleLifecycle(schedule_repository, schedule_rsvp_service)
+feature_registry.register(schedule_lifecycle)
+
 # Scheduled-night /party subcommands are owned by the schedule feature module
 # (Issue #48); bot.py wires it with injected dependencies.
 _schedule_deps = ScheduleCommandDeps(
@@ -893,8 +911,10 @@ _schedule_deps = ScheduleCommandDeps(
     ready_check_view=lambda: ReadyCheckView(_handle_ready_check_action),
     lobby_card_embed=lambda lobby: _lobby_card_embed(lobby),
     lobby_card_view=lambda: LobbyCardView(_handle_lobby_card_action),
+    schedule_rsvp_service=schedule_rsvp_service,
 )
 register_schedule_commands(party_commands, _schedule_deps)
+party_session_refresh = party_commands.session_refresh
 party_schedule = party_commands.schedule
 party_confirm = party_commands.confirm
 party_rsvp = party_commands.rsvp
@@ -1055,6 +1075,12 @@ async def _handle_inactivity_prompt_action(
     interaction: discord.Interaction, action: str
 ) -> None:
     await party_lobby_service.handle_inactivity_prompt_action(interaction, action)
+
+
+async def _handle_schedule_rsvp_action(
+    interaction: discord.Interaction, action: str
+) -> None:
+    await schedule_rsvp_service.handle_rsvp_action(interaction, action)
 
 
 async def _handle_role_preference(interaction: discord.Interaction, role_key: str) -> None:

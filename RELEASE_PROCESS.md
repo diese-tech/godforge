@@ -39,14 +39,14 @@ Tag `v2.3.0` only after:
 - [x] Public web and API documentation do not promote guarded legacy economy
   surfaces as current features.
 - [x] Optional companion compatibility remains disabled by default.
-- [x] Version strings and release documentation agree at `v2.3.0-rc.4`.
+- [x] Version strings and release documentation agree at `v2.3.0-rc.5`.
 - [x] Legacy web/API surfaces have an explicit removal or archive decision.
 - [x] The active dashboard no longer renders economy, betting, wallet, or ledger
   controls; retained rollback code remains inaccessible by default.
 - [ ] A live Discord smoke test confirms setup, restart recovery, and permission
   failure messaging.
 - [x] Full local tests pass before push.
-- [ ] Required GitHub checks are green on the `rc.4` candidate PR.
+- [ ] Required GitHub checks are green on the `rc.5` candidate PR.
 - [ ] Railway health and the public tools URL pass a live smoke test.
 
 ## Tagging

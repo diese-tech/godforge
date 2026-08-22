@@ -103,8 +103,12 @@ Important status notes:
   a private match workspace automatically, with one in-server roster ping
   and a clickable channel mention — GodForge never depends on DMs.
 - `/party schedule` creates one-time or weekly custom nights after explicit
-  timezone confirmation. RSVPs retain saved roles, overflow into a waitlist,
-  receive reminders, export to ICS, and open into the same durable lobby flow.
+  timezone confirmation. Confirming auto-publishes a persistent RSVP card
+  (Going/Maybe/Can't Make It buttons, no command required) that stays live
+  for the whole RSVP window, self-heals if deleted, and — for weekly nights
+  — rolls the same message forward to each next occurrence instead of
+  reposting. RSVPs retain saved roles, overflow into a waitlist, receive
+  reminders, export to ICS, and open into the same durable lobby flow.
 - `/scrim team-create`, `/scrim challenge`, and `/scrim launch` coordinate
   premade teams and then reuse the scheduled-night, party, room, draft, and
   result workflow. See [`docs/TEAM_SCRIMS.md`](docs/TEAM_SCRIMS.md).
@@ -381,7 +385,7 @@ contract before smoke-testing `.rc`.
 - Stabilize the live dashboard bridge and OAuth permission checks.
 - Follow the sequencing and linked implementation issues in
   [`docs/STANDALONE_PRODUCT_PLAN.md`](docs/STANDALONE_PRODUCT_PLAN.md).
-- The `v2.3.0-rc.4` feature scope is complete. Stable `v2.3.0` remains gated
+- The `v2.3.0-rc.5` feature scope is complete. Stable `v2.3.0` remains gated
   on live Discord recovery/permission checks and Railway/public-tools smoke
   tests documented in [`RELEASE_PROCESS.md`](RELEASE_PROCESS.md).
 

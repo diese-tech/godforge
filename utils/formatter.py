@@ -12,7 +12,7 @@ import discord
 from utils.forgelens_adapter import forgelens_enabled
 
 
-GODFORGE_VERSION = "2.3.0-rc.4"
+GODFORGE_VERSION = "2.3.0-rc.5"
 RELEASE_NOTES = "Release notes: VERSION_HISTORY.md"
 
 # Buff-themed role colors (Smite 2 has no green buff; support takes green).

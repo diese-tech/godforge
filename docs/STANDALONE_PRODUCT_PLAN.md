@@ -1,6 +1,6 @@
 # GodForge Standalone Product Plan
 
-Status: implementation complete; live validation pending (`v2.3.0-rc.4`)
+Status: implementation complete; live validation pending (`v2.3.0-rc.5`)
 Last updated: August 20, 2026
 
 ## Implementation tracker

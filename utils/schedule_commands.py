@@ -26,6 +26,7 @@ from discord import app_commands
 from utils.party import LobbyState
 from utils.party_queue import QueueError
 from utils.party_schedule import (
+    EventState,
     Recurrence,
     ScheduleError,
     calendar_ics,
@@ -45,6 +46,10 @@ class ScheduleCommandDeps:
     ready_check_view: Callable[[], discord.ui.View]
     lobby_card_embed: Callable
     lobby_card_view: Callable[[], discord.ui.View]
+    # Issue #67: the public RSVP card service. Optional so existing tests
+    # that construct ScheduleCommandDeps without it keep working; a deps
+    # object missing this collaborator just skips card auto-publish/refresh.
+    schedule_rsvp_service: object | None = None
 
 
 def register_schedule_commands(
@@ -121,9 +126,14 @@ def register_schedule_commands(
         except ScheduleError as exc:
             await interaction.response.send_message(str(exc), ephemeral=True)
             return
+        # Issue #67: auto-publish the persistent RSVP card — no separate
+        # Share step. Best-effort like every other public-card operation;
+        # `/party rsvp` remains a working fallback either way.
+        if deps.schedule_rsvp_service is not None and interaction.guild is not None:
+            await deps.schedule_rsvp_service.ensure_rsvp_card(event, interaction.guild)
         await interaction.response.send_message(
             f"Scheduled **{event.title}** for <t:{int(event.starts_at.timestamp())}:f>. "
-            f"RSVP with `/party rsvp {event.event_id}`."
+            f"RSVP on the card above, or with `/party rsvp {event.event_id}`."
         )
 
     @group.command(name="rsvp", description="Reserve a seat in a scheduled custom night")
@@ -145,6 +155,10 @@ def register_schedule_commands(
         except ScheduleError as exc:
             await interaction.response.send_message(str(exc), ephemeral=True)
             return
+        # This command is a fallback surface for the RSVP card (Issue #67) —
+        # a mutation through either one must refresh the same canonical card.
+        if deps.schedule_rsvp_service is not None and interaction.guild is not None:
+            await deps.schedule_rsvp_service.refresh_rsvp_card(event, interaction.guild)
         waitlisted = any(item.user_id == interaction.user.id for item in event.waitlist)
         await interaction.response.send_message(
             (
@@ -165,10 +179,12 @@ def register_schedule_commands(
             )
             return
         try:
-            deps.schedule_repository.cancel_rsvp(event_id, interaction.user.id)
+            changed = deps.schedule_repository.cancel_rsvp(event_id, interaction.user.id)
         except ScheduleError as exc:
             await interaction.response.send_message(str(exc), ephemeral=True)
             return
+        if deps.schedule_rsvp_service is not None and interaction.guild is not None:
+            await deps.schedule_rsvp_service.refresh_rsvp_card(changed, interaction.guild)
         await interaction.response.send_message("Reservation released.", ephemeral=True)
 
     @group.command(name="events", description="List upcoming SMITE custom nights")
@@ -233,6 +249,16 @@ def register_schedule_commands(
         except (ScheduleError, ValueError, QueueError) as exc:
             await interaction.response.send_message(str(exc), ephemeral=True)
             return
+        # Issue #67 point 5/6: a weekly rollover already carried the RSVP
+        # card's delivery ref forward to the new occurrence in the same
+        # transaction as mark_converted() — refresh *that* row's card so the
+        # same Discord message now shows the next occurrence with a fresh
+        # roster. A one-time night has no successor, so its own card gets
+        # one final edit into its terminal "session started" state instead.
+        if deps.schedule_rsvp_service is not None and interaction.guild is not None:
+            successor = deps.schedule_repository.find_successor(event_id)
+            target = successor or deps.schedule_repository.get(event_id)
+            await deps.schedule_rsvp_service.refresh_rsvp_card(target, interaction.guild)
         queue = await deps.party_queue_service.get(lobby.lobby_id)
         if lobby.state is LobbyState.READY_CHECK and queue is not None:
             await interaction.response.send_message(
@@ -248,6 +274,47 @@ def register_schedule_commands(
                 view=deps.lobby_card_view(),
             )
 
+    @group.command(
+        name="session-refresh",
+        description="Reconcile a scheduled night's public RSVP card without recreating it",
+    )
+    async def session_refresh(interaction: discord.Interaction, event_id: str):
+        if interaction.guild_id is None:
+            await interaction.response.send_message("Server-only command.", ephemeral=True)
+            return
+        event = deps.schedule_repository.get(event_id)
+        if event is None or event.guild_id != interaction.guild_id:
+            await interaction.response.send_message(
+                "Scheduled night not found.", ephemeral=True
+            )
+            return
+        is_organizer = event.organizer_id == interaction.user.id
+        can_manage = bool(getattr(interaction.user.guild_permissions, "manage_guild", False))
+        if not (is_organizer or can_manage):
+            await interaction.response.send_message(
+                "Only the organizer or a server manager can refresh this card.",
+                ephemeral=True,
+            )
+            return
+        if event.state is not EventState.SCHEDULED:
+            await interaction.response.send_message(
+                "Confirm this scheduled night with `/party confirm` before it can have "
+                "a public RSVP card.",
+                ephemeral=True,
+            )
+            return
+        if deps.schedule_rsvp_service is None:
+            await interaction.response.send_message(
+                "RSVP cards are not available.", ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        _, posted = await deps.schedule_rsvp_service.ensure_rsvp_card(event, interaction.guild)
+        await interaction.followup.send(
+            "Posted a new RSVP card." if posted else "RSVP card reconciled.",
+            ephemeral=True,
+        )
+
     group.schedule = schedule
     group.confirm = confirm
     group.rsvp = rsvp
@@ -255,3 +322,4 @@ def register_schedule_commands(
     group.events = events
     group.calendar = calendar
     group.open_scheduled = open_scheduled
+    group.session_refresh = session_refresh

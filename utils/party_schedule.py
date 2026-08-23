@@ -57,6 +57,16 @@ class ScheduledNight:
     rsvps: tuple[RSVP, ...] = ()
     waitlist: tuple[RSVP, ...] = ()
     lobby_id: str | None = None
+    # Issue #67: tentative "Maybe" responses, tracked entirely separately
+    # from ``rsvps``/``waitlist`` — they never occupy a seat or a waitlist
+    # position.
+    maybe: tuple[RSVP, ...] = ()
+    # Issue #67: the durable public RSVP card location, so a restart or a
+    # retried reconciliation edits the existing message instead of posting
+    # a duplicate one. For a weekly series this same channel/message id is
+    # carried forward to each new occurrence rather than reposted.
+    delivery_channel_id: int | None = None
+    delivery_message_id: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "starts_at", ensure_utc(self.starts_at))
@@ -234,6 +244,33 @@ class ScheduleRepository:
             );
             """
         )
+        # Issue #67 additions.
+        ScheduleRepository._add_columns(
+            conn,
+            "scheduled_nights",
+            {
+                "delivery_channel_id": "INTEGER",
+                "delivery_message_id": "INTEGER",
+                # Set only on the weekly successor row a rollover creates,
+                # so the public-card reconciliation pass can find it without
+                # guessing from title/guild/timing.
+                "predecessor_event_id": "TEXT",
+            },
+        )
+        ScheduleRepository._add_columns(
+            conn,
+            "scheduled_rsvps",
+            {"response": "TEXT NOT NULL DEFAULT 'going'"},
+        )
+
+    @staticmethod
+    def _add_columns(conn, table: str, columns: dict[str, str]) -> None:
+        existing = {
+            row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        for name, declaration in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
 
     def create(
         self, *, guild_id: int, organizer_id: int, title: str, starts_at: datetime,
@@ -307,62 +344,156 @@ class ScheduleRepository:
         return self.get(event_id)
 
     def rsvp(self, event_id: str, user_id: int, preferences: PlayerPreferences) -> ScheduledNight:
+        """Reserve a Going seat (or promote an existing Maybe response to Going).
+
+        A player who is already Going keeps their queue position, but their
+        stored role preferences are refreshed — needed for the RSVP card's
+        "Change Roles" escape hatch, which re-submits this same call with
+        updated preferences for a player who never left Going. A player who
+        was Maybe is moved into the Going roster/waitlist at the back of the
+        line, same as a brand-new RSVP.
+        """
         with self._transaction() as conn:
             event = self._required(conn, event_id)
             if event["state"] != EventState.SCHEDULED:
                 raise ScheduleError("RSVPs require a confirmed scheduled night")
             prior = conn.execute(
-                "SELECT 1 FROM scheduled_rsvps WHERE event_id=? AND user_id=?",
+                "SELECT response FROM scheduled_rsvps WHERE event_id=? AND user_id=?",
                 (event_id, user_id),
             ).fetchone()
-            if not prior:
-                count = conn.execute(
-                    "SELECT COUNT(*) count FROM scheduled_rsvps WHERE event_id=?",
-                    (event_id,),
-                ).fetchone()["count"]
+            if prior is not None and prior["response"] == "going":
                 conn.execute(
-                    """INSERT INTO scheduled_rsvps
-                       VALUES (?,?,?,?,?,?,?,?,?)""",
+                    """UPDATE scheduled_rsvps SET primary_role=?,secondary_role=?,
+                       fill=?,captain=? WHERE event_id=? AND user_id=?""",
                     (
-                        event_id, user_id, count + 1, int(count >= event["capacity"]),
                         preferences.primary_role, preferences.secondary_role,
                         int(preferences.fill), int(preferences.captain),
-                        datetime.now(timezone.utc).isoformat(),
+                        event_id, user_id,
                     ),
                 )
+            else:
+                count = conn.execute(
+                    "SELECT COUNT(*) count FROM scheduled_rsvps WHERE event_id=? AND response='going'",
+                    (event_id,),
+                ).fetchone()["count"]
+                position, waitlisted = count + 1, int(count >= event["capacity"])
+                if prior is None:
+                    conn.execute(
+                        """INSERT INTO scheduled_rsvps
+                           (event_id,user_id,position,waitlisted,response,primary_role,
+                            secondary_role,fill,captain,joined_at)
+                           VALUES (?,?,?,?,'going',?,?,?,?,?)""",
+                        (
+                            event_id, user_id, position, waitlisted,
+                            preferences.primary_role, preferences.secondary_role,
+                            int(preferences.fill), int(preferences.captain),
+                            datetime.now(timezone.utc).isoformat(),
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        """UPDATE scheduled_rsvps SET response='going',position=?,waitlisted=?,
+                           primary_role=?,secondary_role=?,fill=?,captain=?
+                           WHERE event_id=? AND user_id=?""",
+                        (
+                            position, waitlisted,
+                            preferences.primary_role, preferences.secondary_role,
+                            int(preferences.fill), int(preferences.captain),
+                            event_id, user_id,
+                        ),
+                    )
+        return self.get(event_id)
+
+    def rsvp_maybe(
+        self, event_id: str, user_id: int, preferences: PlayerPreferences
+    ) -> ScheduledNight:
+        """Record a tentative response — never occupies a seat or waitlist slot.
+
+        A player who was already Going has their seat released first (and
+        anyone behind them promoted), exactly like ``cancel_rsvp``, since
+        Maybe is not a stronger commitment than Going.
+        """
+        with self._transaction() as conn:
+            event = self._required(conn, event_id)
+            if event["state"] != EventState.SCHEDULED:
+                raise ScheduleError("RSVPs require a confirmed scheduled night")
+            prior = conn.execute(
+                "SELECT response FROM scheduled_rsvps WHERE event_id=? AND user_id=?",
+                (event_id, user_id),
+            ).fetchone()
+            if prior is not None and prior["response"] == "going":
+                self._remove_going_and_reindex(conn, event_id, user_id, event["capacity"])
+            conn.execute(
+                """INSERT INTO scheduled_rsvps
+                   (event_id,user_id,position,waitlisted,response,primary_role,
+                    secondary_role,fill,captain,joined_at)
+                   VALUES (?,?,0,0,'maybe',?,?,?,?,?)
+                   ON CONFLICT(event_id,user_id) DO UPDATE SET
+                     response='maybe',position=0,waitlisted=0,
+                     primary_role=excluded.primary_role,
+                     secondary_role=excluded.secondary_role,
+                     fill=excluded.fill,captain=excluded.captain""",
+                (
+                    event_id, user_id,
+                    preferences.primary_role, preferences.secondary_role,
+                    int(preferences.fill), int(preferences.captain),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
         return self.get(event_id)
 
     def cancel_rsvp(self, event_id: str, user_id: int) -> ScheduledNight:
+        """Remove any Going or Maybe response — the "Can't Make It" action."""
         with self._transaction() as conn:
-            self._required(conn, event_id)
-            conn.execute(
-                "DELETE FROM scheduled_rsvps WHERE event_id=? AND user_id=?",
+            event = self._required(conn, event_id)
+            prior = conn.execute(
+                "SELECT response FROM scheduled_rsvps WHERE event_id=? AND user_id=?",
                 (event_id, user_id),
-            )
-            rows = conn.execute(
-                "SELECT user_id FROM scheduled_rsvps WHERE event_id=? ORDER BY position",
-                (event_id,),
-            ).fetchall()
-            capacity = conn.execute(
-                "SELECT capacity FROM scheduled_nights WHERE event_id=?", (event_id,)
-            ).fetchone()["capacity"]
-            for index, row in enumerate(rows):
+            ).fetchone()
+            if prior is None:
+                return self.get(event_id)
+            if prior["response"] == "going":
+                self._remove_going_and_reindex(conn, event_id, user_id, event["capacity"])
+            else:
                 conn.execute(
-                    """UPDATE scheduled_rsvps SET position=?,waitlisted=?
-                       WHERE event_id=? AND user_id=?""",
-                    (index + 1, int(index >= capacity), event_id, row["user_id"]),
+                    "DELETE FROM scheduled_rsvps WHERE event_id=? AND user_id=?",
+                    (event_id, user_id),
                 )
         return self.get(event_id)
 
+    @staticmethod
+    def _remove_going_and_reindex(conn, event_id: str, user_id: int, capacity: int) -> None:
+        conn.execute(
+            "DELETE FROM scheduled_rsvps WHERE event_id=? AND user_id=? AND response='going'",
+            (event_id, user_id),
+        )
+        rows = conn.execute(
+            "SELECT user_id FROM scheduled_rsvps WHERE event_id=? AND response='going' "
+            "ORDER BY position",
+            (event_id,),
+        ).fetchall()
+        for index, row in enumerate(rows):
+            conn.execute(
+                """UPDATE scheduled_rsvps SET position=?,waitlisted=?
+                   WHERE event_id=? AND user_id=?""",
+                (index + 1, int(index >= capacity), event_id, row["user_id"]),
+            )
+
     def mark_converted(self, event_id: str, lobby_id: str) -> ScheduledNight:
+        """Convert this occurrence and, for a weekly series, schedule the next one.
+
+        Issue #67: the public RSVP card's delivery reference transfers to the
+        newly-created successor row rather than being reposted — this is what
+        lets the periodic reconciliation edit the *same* Discord message
+        forward to the next occurrence instead of accumulating a new card
+        every week. A one-time night keeps its delivery ref on the converted
+        row itself, since there's no successor to hand it to; the caller is
+        responsible for one final edit showing the "session started" state.
+        """
         with self._transaction() as conn:
             event = self._required(conn, event_id)
             if event["lobby_id"] and event["lobby_id"] != lobby_id:
                 raise ScheduleError("scheduled night already converted to another lobby")
-            conn.execute(
-                "UPDATE scheduled_nights SET state=?,lobby_id=? WHERE event_id=?",
-                (EventState.CONVERTED, lobby_id, event_id),
-            )
             if event["recurrence"] == Recurrence.WEEKLY:
                 zone = ZoneInfo(event["timezone_name"])
                 prior_local = datetime.fromisoformat(event["starts_at"]).astimezone(zone)
@@ -379,16 +510,62 @@ class ScheduleRepository:
                 conn.execute(
                     """INSERT OR IGNORE INTO scheduled_nights
                        (event_id,guild_id,organizer_id,title,starts_at,timezone_name,
-                        recurrence,capacity,role_slots,reminder_minutes,state,lobby_id)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL)""",
+                        recurrence,capacity,role_slots,reminder_minutes,state,lobby_id,
+                        delivery_channel_id,delivery_message_id,predecessor_event_id)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL,?,?,?)""",
                     (
                         next_id, event["guild_id"], event["organizer_id"], event["title"],
                         next_start.isoformat(), event["timezone_name"], event["recurrence"],
                         event["capacity"], event["role_slots"], event["reminder_minutes"],
                         EventState.SCHEDULED,
+                        event["delivery_channel_id"], event["delivery_message_id"], event_id,
                     ),
                 )
+                conn.execute(
+                    "UPDATE scheduled_nights SET state=?,lobby_id=?,"
+                    "delivery_channel_id=NULL,delivery_message_id=NULL WHERE event_id=?",
+                    (EventState.CONVERTED, lobby_id, event_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE scheduled_nights SET state=?,lobby_id=? WHERE event_id=?",
+                    (EventState.CONVERTED, lobby_id, event_id),
+                )
         return self.get(event_id)
+
+    def find_successor(self, event_id: str) -> ScheduledNight | None:
+        """The weekly-rollover occurrence created when ``event_id`` converted, if any."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT event_id FROM scheduled_nights WHERE predecessor_event_id=?",
+                (event_id,),
+            ).fetchone()
+        return self.get(row["event_id"]) if row else None
+
+    def set_delivery(
+        self, event_id: str, channel_id: int | None, message_id: int | None
+    ) -> ScheduledNight:
+        """Persist (or clear) the durable public RSVP card location."""
+        with self._transaction() as conn:
+            self._required(conn, event_id)
+            conn.execute(
+                "UPDATE scheduled_nights SET delivery_channel_id=?,delivery_message_id=? "
+                "WHERE event_id=?",
+                (channel_id, message_id, event_id),
+            )
+        return self.get(event_id)
+
+    def list_all_upcoming(self, *, now: datetime | None = None) -> list[ScheduledNight]:
+        """Every guild's confirmed/pending scheduled nights, for cross-guild reconciliation."""
+        at = (ensure_utc(now) or datetime.now(timezone.utc)).isoformat()
+        with self._connect() as conn:
+            ids = conn.execute(
+                """SELECT event_id FROM scheduled_nights
+                   WHERE starts_at>=? AND state IN (?,?)
+                   ORDER BY starts_at""",
+                (at, EventState.PENDING_CONFIRMATION, EventState.SCHEDULED),
+            ).fetchall()
+        return [event for row in ids if (event := self.get(row["event_id"]))]
 
     def claim_due_reminders(
         self, *, now: datetime | None = None
@@ -449,15 +626,25 @@ class ScheduleRepository:
             )
             for member in members
         ]
-        active = tuple(item for item, member in zip(decoded, members) if not member["waitlisted"])
-        waitlist = tuple(item for item, member in zip(decoded, members) if member["waitlisted"])
+        active = tuple(
+            item for item, member in zip(decoded, members)
+            if member["response"] == "going" and not member["waitlisted"]
+        )
+        waitlist = tuple(
+            item for item, member in zip(decoded, members)
+            if member["response"] == "going" and member["waitlisted"]
+        )
+        maybe = tuple(
+            item for item, member in zip(decoded, members) if member["response"] == "maybe"
+        )
         return ScheduledNight(
             row["event_id"], row["guild_id"], row["organizer_id"], row["title"],
             datetime.fromisoformat(row["starts_at"]), row["timezone_name"],
             row["recurrence"], row["capacity"],
             tuple(filter(None, row["role_slots"].split(","))),
             tuple(int(v) for v in row["reminder_minutes"].split(",") if v),
-            row["state"], active, waitlist, row["lobby_id"],
+            row["state"], active, waitlist, row["lobby_id"], maybe,
+            row["delivery_channel_id"], row["delivery_message_id"],
         )
 
 

@@ -53,7 +53,7 @@ Latest stable release. Historical scope:
 
 ## v2.3.0 - Standalone Party Foundation
 
-Current release candidate (`v2.3.0-rc.4`). The implementation scope is
+Current release candidate (`v2.3.0-rc.5`). The implementation scope is
 complete; live Discord and Railway validation remain before the stable tag.
 
 - **Standalone product boundary**: normal GodForge workflows and help surfaces no
@@ -136,9 +136,23 @@ complete; live Discord and Railway validation remain before the stable tag.
   the lobby all now delete the public queue card instead of leaving a dead
   "cancelled"/"expired" status behind. A periodic self-healing sweep cleans
   up any card left over from a crash mid-cleanup.
+- **Scheduled-session RSVP cards** (`rc.5`, Issue #67): confirming a
+  scheduled night now auto-publishes a persistent, button-first RSVP card
+  (Going/Maybe/Can't Make It) to the Play channel instead of requiring
+  players to know an RSVP command. First-time Going shows the same
+  lightweight role picker as joining a queue; a returning player with saved
+  roles RSVPs in one click. Every RSVP mutation — from the card or the
+  `/party rsvp`/`unrsvp` fallback commands — refreshes the one canonical
+  card via its durable delivery reference. A weekly night rolls the same
+  Discord message forward to each next occurrence with a fresh roster
+  instead of posting a new card every week; RSVP history for the occurrence
+  that just converted stays durable for audit. Startup recovery and every
+  periodic sweep reconcile every guild's cards (post-if-missing,
+  repost-if-deleted, never duplicated), and `/party session-refresh`
+  provides the same reconciliation on demand.
 
 ## Future Version Gates
 
-- `v2.3`: Feature scope is complete at `rc.4`; validate setup, recovery,
+- `v2.3`: Feature scope is complete at `rc.5`; validate setup, recovery,
   permissions, Railway health, and the public tools surface before tagging.
 - `v3.0`: Full dual-use platform milestone with standalone web users and production-grade assets.

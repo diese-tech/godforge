@@ -40,6 +40,11 @@ def _interaction(*, guild_id=1, user_id=100):
     interaction = MagicMock()
     interaction.id = 999
     interaction.guild_id = guild_id
+    # None (not an auto-generated truthy MagicMock) so the Issue #67
+    # card-refresh calls these handlers now make are no-ops here — this
+    # file characterizes command-level behavior; card behavior has its own
+    # dedicated tests in test_schedule_rsvp_cards.py.
+    interaction.guild = None
     interaction.user = MagicMock(id=user_id)
     interaction.response = MagicMock()
     interaction.response.send_message = AsyncMock()
